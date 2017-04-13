@@ -87,3 +87,7 @@ ENV/
 
 # Rope project settings
 .ropeproject
+
+# dirs for tensorflow logs and checkpoints
+*/checkpoints/
+*/tensorboards/
