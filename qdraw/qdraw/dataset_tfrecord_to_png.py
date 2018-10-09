@@ -1,5 +1,7 @@
 """
 """
+import random
+
 import skimage.io
 import tensorflow as tf
 
@@ -71,7 +73,8 @@ def main(_):
     with tf.Session() as session:
         session.run(iterator.initializer)
 
-        sample = session.run(next_sample)
+        for _ in range(random.randint(0, 32)):
+            sample = session.run(next_sample)
 
     if FLAGS.labeled:
         print('label: {}'.format(sample[1]))
