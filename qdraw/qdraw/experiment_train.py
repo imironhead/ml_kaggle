@@ -37,13 +37,9 @@ def build_dataset():
     # NOTE: create an op to iterate the datasets
     next_image_batch, next_label_batch = iterator.get_next()
 
-    # NOTE: make images and labels replaceable
-    images = tf.identity(next_image_batch, name='images')
-    labels = tf.identity(next_label_batch, name='labels')
-
     return {
-        'images': images,
-        'labels': labels,
+        'images': next_image_batch,
+        'labels': next_label_batch,
         'train_iterator': train_iterator,
         'valid_iterator': valid_iterator,
         'dataset_handle': dataset_handle,
@@ -105,7 +101,7 @@ def train(session, step, model, dataset, dataset_handle, summaries, reporter):
 def valid(session, step, model, dataset, dataset_handle, summaries, reporter):
     """
     """
-    if step % 1000 != 0:
+    if step % 10000 != 0:
         return step
 
     session.run(dataset['valid_iterator'].initializer)
@@ -138,9 +134,6 @@ def valid(session, step, model, dataset, dataset_handle, summaries, reporter):
 
             for i in range(3):
                 ap += np.sum(logits[:, i] == labels) / float(i + 1)
-
-            if num_images > 1000:
-                break
         except tf.errors.OutOfRangeError:
             break
 
@@ -157,13 +150,6 @@ def valid(session, step, model, dataset, dataset_handle, summaries, reporter):
     print('validate [{}]: {}'.format(valid_elapsed, map_at_3))
 
     return step
-
-
-def save_model(session, step, target_ckpt_path):
-    """
-    """
-    if step % 10000 == 0:
-        tf.train.Saver().save(session, target_ckpt_path, global_step=step)
 
 
 def main(_):
@@ -229,7 +215,24 @@ def main(_):
                 summaries,
                 reporter)
 
-            save_model(session, step, target_ckpt_path)
+            if step >= FLAGS.stop_at_step:
+                break
+
+        tf.train.Saver().save(
+            session, target_ckpt_path, write_meta_graph=False)
+
+    # NOTE: save meta
+    tf.reset_default_graph()
+
+    dataset['images'] = tf.placeholder(
+        tf.float32,
+        shape=[None, FLAGS.image_size, FLAGS.image_size, 1],
+        name='images')
+    dataset['labels'] = None
+
+    model = build_model(dataset)
+
+    tf.train.Saver().export_meta_graph(target_ckpt_path + '.meta')
 
 
 if __name__ == '__main__':
@@ -243,6 +246,8 @@ if __name__ == '__main__':
 
     tf.app.flags.DEFINE_integer('image_size', 28, '')
     tf.app.flags.DEFINE_integer('batch_size', 100, '')
+
+    tf.app.flags.DEFINE_integer('stop_at_step', 1000, '')
 
     tf.app.run()
 

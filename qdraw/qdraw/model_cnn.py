@@ -13,36 +13,36 @@ def build_model(images, labels):
 
     tensors = images
 
-    for i in range(4):
+    for index, filters in enumerate([32, 64, 128, 256]):
         tensors = tf.layers.conv2d(
             tensors,
-            filters=128,
+            filters=filters,
             kernel_size=3,
             strides=1,
-            padding='same',
+            padding='valid',
             data_format='channels_last',
             activation=tf.nn.relu,
             use_bias=True,
             kernel_initializer=initializer,
-            name='conv_{}'.format(i))
+            name='conv_{}'.format(index))
 
         # NOTE: norm ?
 
     # NOTE: position tag
-    x = np.linspace(-1.0, 1.0, 28, dtype=np.float32)
-    u, v = np.meshgrid(x, x)
+#   x = np.linspace(-1.0, 1.0, 28, dtype=np.float32)
+#   u, v = np.meshgrid(x, x)
 
-    u = np.reshape(u, [1, 28, 28, 1])
-    v = np.reshape(v, [1, 28, 28, 1])
+#   u = np.reshape(u, [1, 28, 28, 1])
+#   v = np.reshape(v, [1, 28, 28, 1])
 
-    coordinates = np.concatenate([u, v], axis=-1)
-    coordinates = tf.constant(coordinates)
+#   coordinates = np.concatenate([u, v], axis=-1)
+#   coordinates = tf.constant(coordinates)
 
-    n = tf.shape(tensors)[0]
+#   n = tf.shape(tensors)[0]
 
-    coordinates = tf.tile(coordinates, [n, 1, 1, 1])
+#   coordinates = tf.tile(coordinates, [n, 1, 1, 1])
 
-    tensors = tf.concat([tensors, coordinates], axis=-1)
+#   tensors = tf.concat([tensors, coordinates], axis=-1)
 
     # NOTE: flatten for fc
     tensors = tf.layers.flatten(tensors)
@@ -66,6 +66,15 @@ def build_model(images, labels):
         kernel_initializer=initializer,
         name='final')
 
+    logits = tf.identity(logits, name='logits')
+
+    # NOTE: build a simplier model without traning op
+    if labels is None:
+        return {
+            'images': images,
+            'logits': logits,
+        }
+
     loss = tf.losses.sparse_softmax_cross_entropy(
         labels,
         logits,
@@ -82,9 +91,9 @@ def build_model(images, labels):
     return {
         'images': images,
         'labels': labels,
+        'logits': logits,
         'loss': loss,
         'step': step,
-        'logits': logits,
         'optimizer': optimizer,
         'learning_rate': learning_rate,
     }
