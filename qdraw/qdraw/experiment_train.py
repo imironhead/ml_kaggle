@@ -56,6 +56,8 @@ def build_model(dataset):
         import qdraw.model_capsule as chosen_model
     elif FLAGS.model == 'cnn':
         import qdraw.model_cnn as chosen_model
+    elif FLAGS.model == 'resnet':
+        import qdraw.model_resnet as chosen_model
 
     return chosen_model.build_model(dataset['images'], dataset['labels'])
 
