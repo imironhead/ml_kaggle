@@ -30,14 +30,11 @@ if __name__ == '__main__':
     with open(args.source_csv_path, newline='') as csv_file:
         draws = csv.reader(csv_file, delimiter=',')
 
-        # NOTE: skip header
-        next(draws)
-
         ids = [draw[0] for draw in draws]
 
     # NOTE:
-    with gzip.open(args.result_zip_path, mode='wt', newline='') as zip_file:
-        writer = csv.writer(zip_file, delimiter=',')
+    with gzip.open(args.result_zip_path, mode='wt', encoding='utf-8') as zip_file:
+        writer = csv.writer(zip_file, lineterminator='\n')
 
         writer.writerow(['key_id', 'word'])
 

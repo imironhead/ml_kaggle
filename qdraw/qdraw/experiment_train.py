@@ -18,13 +18,25 @@ def build_dataset():
     train_record_paths = tf.placeholder(tf.string, shape=[None])
 
     train_iterator = dataset_iterator.build_iterator(
-        True, train_record_paths, FLAGS.batch_size, FLAGS.image_size)
+        train_record_paths,
+        batch_size=FLAGS.batch_size,
+        is_training=True,
+        has_strokes=False,
+        has_image=True,
+        has_label=True,
+        image_size=32)
 
     # NOTE: iterator for validation dataset
     valid_record_paths = [FLAGS.valid_tfr_path]
 
     valid_iterator = dataset_iterator.build_iterator(
-        False, valid_record_paths, FLAGS.batch_size, FLAGS.image_size)
+        valid_record_paths,
+        batch_size=FLAGS.batch_size,
+        is_training=False,
+        has_strokes=False,
+        has_image=True,
+        has_label=True,
+        image_size=32)
 
     # NOTE: a string handle as training/validation set switch
     dataset_handle = tf.placeholder(tf.string, shape=[])

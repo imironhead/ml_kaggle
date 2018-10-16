@@ -17,7 +17,8 @@ def build_dataset():
         })
 
         image = tf.decode_raw(features['image'], tf.uint8)
-
+        image = tf.cast(image, tf.float32)
+        image = (image - 127.5) / 127.5
         image = tf.reshape(image, [FLAGS.image_size, FLAGS.image_size, 1])
 
         return image

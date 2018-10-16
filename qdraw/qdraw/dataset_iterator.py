@@ -1,53 +1,91 @@
 """
 """
+import functools
+import os
+
 import tensorflow as tf
 
 
-def build_decoder(image_size):
+def decode(example, has_strokes, has_image, has_label, image_size):
     """
     """
-    def decode_image_with_label(serialized_example):
-        """
-        """
-        features = tf.parse_single_example(serialized_example, features={
-            'image': tf.FixedLenFeature([], tf.string),
-            'label': tf.FixedLenFeature([], tf.int64),
-        })
+    features = {}
 
+    if has_strokes:
+        features['strokes'] = tf.FixedLenFeature([], tf.string)
+
+    if has_image:
+        features['image'] = tf.FixedLenFeature([], tf.string)
+
+    if has_label:
+        features['label'] = tf.FixedLenFeature([], tf.int64)
+
+    features = tf.parse_single_example(example, features=features)
+
+    returns = []
+
+    if has_strokes:
+        strokes = tf.decode_raw(features['strokes'], tf.float32)
+
+        returns.append(strokes)
+
+    if has_image:
         image = tf.decode_raw(features['image'], tf.uint8)
-
         image = tf.cast(image, tf.float32)
-
         image = (image - 127.5) / 127.5
-
         image = tf.reshape(image, [image_size, image_size, 1])
 
+        returns.append(image)
+
+    if has_label:
         label = tf.cast(features['label'], tf.int32)
 
-        return image, label
+        returns.append(label)
 
-    return decode_image_with_label
+    return returns
 
 
-def build_iterator(training, record_paths, batch_size, image_size):
+def build_iterator(
+        record_paths,
+        batch_size,
+        is_training,
+        has_strokes,
+        has_image,
+        has_label,
+        image_size):
     """
     read TFRecord batch.
     """
-    # NOTE: read tfrecord, can we load faster with large buffer_size?
-    data = tf.data.TFRecordDataset(record_paths, buffer_size=2**20)
+    fn_decode = functools.partial(
+        decode,
+        has_strokes=has_strokes,
+        has_image=has_image,
+        has_label=has_label,
+        image_size=image_size)
 
-    if training:
+    data = tf.data.Dataset.from_tensor_slices(record_paths)
+
+    if is_training:
+        data = data.shuffle(buffer_size=10)
         data = data.repeat()
 
-    data = data.map(build_decoder(image_size))
+        data = data.interleave(
+            tf.data.TFRecordDataset, cycle_length=10, block_length=1)
 
-    if training:
         data = data.shuffle(buffer_size=10000)
+    else:
+        data = tf.data.TFRecordDataset(data)
 
-    data = data.batch(batch_size=batch_size)
+    data = data.map(fn_decode)
 
-    # NOTE: create the final iterator
-    iterator = data.make_initializable_iterator()
+    data = data.prefetch(10000)
 
-    return iterator
+    # NOTE: shape of strokes is not fixed
+    if has_strokes:
+        data = data.padded_batch(
+            batch_size=batch_size, padded_shapes=data.output_shapes)
+    else:
+        data = data.batch(batch_size=batch_size)
+
+    return data.make_initializable_iterator()
 

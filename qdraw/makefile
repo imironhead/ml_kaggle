@@ -15,7 +15,7 @@ deploy-gcp:
 	gcloud compute scp makefile $(WORKER_HOST):$(PROJECT_PATH)/../ --zone=$(WORKER_ZONE)
 
 deploy-hecate: WORKER_HOST=hecate-worker
-deploy-hecate: WORKER_ZONE=asia-east1-b
+deploy-hecate: WORKER_ZONE=asia-east1-a
 deploy-hecate: deploy-gcp
 
 deploy-hecate-gpu: WORKER_HOST=hecate-worker-tesla-p100
@@ -37,18 +37,19 @@ train:
 		--ckpt_path=$(CKPT_PATH)/ \
 		--logs_path=$(LOGS_PATH)/ \
 		--model=$(MODEL) \
-		--train_dir_path=/home/ironhead/datasets/qdraw/28x28/train_pure/ \
-		--valid_tfr_path=/home/ironhead/datasets/qdraw/28x28/valid/valid.tfrecord \
-		--image_size=28 \
+		--train_dir_path=/home/ironhead/datasets/qdraw/complex/train/ \
+		--valid_tfr_path=/home/ironhead/datasets/qdraw/complex/valid/_0000.tfrecord \
+		--image_size=32 \
 		--batch_size=100 \
 		--stop_at_step=500000
 	python3 -m qdraw.experiment_test \
+		--image_size=32 \
 		--ckpt_path=$(CKPT_PATH)/model.ckpt \
-		--source_path=/home/ironhead/datasets/qdraw/28x28/test/test_simplified_28x28.tfrecord \
+		--source_path=/home/ironhead/datasets/qdraw/complex/test/test.tfrecord \
 		--result_path=./results_npz/$(MODEL)_$(TIMESTAMP).npz
 	python3 -m qdraw.experiment_finalize \
 		--source_npz_path=./results_npz/$(MODEL)_$(TIMESTAMP).npz \
-		--source_csv_path=/home/ironhead/datasets/qdraw/test_simplified.csv \
+		--source_csv_path=/home/ironhead/datasets/qdraw/kaggle/test_simplified.csv \
 		--result_zip_path=./results_gz/$(MODEL)_$(TIMESTAMP).gz
 
 train-hecate: CKPT_PATH=gs://hecate-research-ml-results/qdraw/ckpt/$(MODEL)_$(TIMESTAMP)
@@ -64,6 +65,9 @@ train-local: train
 
 train-karina-resnet: MODEL=resnet
 train-karina-resnet: train-local
+
+train-karina-cnn: MODEL=cnn
+train-karina-cnn: train-local
 
 train-laurana-cnn: MODEL=cnn
 train-laurana-cnn: train-local
