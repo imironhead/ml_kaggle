@@ -108,7 +108,6 @@ def train(session, step, model, data, dataset_handle, summaries, reporter):
     feeds = {
         data['dataset_handle']: dataset_handle,
         model['learning_rate']: FLAGS.initial_learning_rate,
-        model['training']: True,
     }
 
     fetch = {
@@ -117,6 +116,9 @@ def train(session, step, model, data, dataset_handle, summaries, reporter):
         'step': model['step'],
         'summary': summaries['loss'],
     }
+
+    if 'training' in model:
+        feeds[model['training']] = True
 
     fetched = session.run(fetch, feed_dict=feeds)
 
@@ -143,13 +145,15 @@ def valid(session, step, model, data, dataset_handle, summaries, reporter):
         try:
             feeds = {
                 data['dataset_handle']: dataset_handle,
-                model['training']: True,
             }
 
             fetch = {
                 'labels': model['labels'],
                 'logits': model['logits'],
             }
+
+            if 'training' in model:
+                feeds[model['training']] = False
 
             fetched = session.run(fetch, feed_dict=feeds)
 
@@ -198,13 +202,15 @@ def test(session, model, data, dataset_handle):
         try:
             feeds = {
                 data['dataset_handle']: dataset_handle,
-                model['training']: True,
             }
 
             fetch = {
                 'keyids': data['keyids'],
                 'logits': model['logits'],
             }
+
+            if 'training' in model:
+                feeds[model['training']] = False
 
             fetched = session.run(fetch, feed_dict=feeds)
 

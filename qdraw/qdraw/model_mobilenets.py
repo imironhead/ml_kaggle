@@ -106,9 +106,12 @@ def build_model(images, strokes, lengths, labels):
 
     learning_rate = tf.placeholder(shape=[], dtype=tf.float32)
 
-    optimizer = tf.train \
-        .AdamOptimizer(learning_rate=learning_rate) \
-        .minimize(loss, global_step=step)
+    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+
+    with tf.control_dependencies(update_ops):
+        optimizer = tf.train \
+            .AdamOptimizer(learning_rate=learning_rate) \
+            .minimize(loss, global_step=step)
 
     return {
         'images': images,
