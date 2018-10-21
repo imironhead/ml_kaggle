@@ -275,11 +275,11 @@ def preprocess_training():
     # NOTE: currently, instead of reusing data, we dorp remainder here
     num_output = min([len(ps) for ps in source_paths_collection])
 
-    with multiprocessing.dummy.Pool(128) as pool:
-        for i in range(0, num_output, 128):
+    with multiprocessing.dummy.Pool(32) as pool:
+        for i in range(0, num_output, 32):
             descriptions = []
 
-            for index in range(i, min(i + 128, num_output)):
+            for index in range(i, min(i + 32, num_output)):
                 # NOTE: build result name with prefix and index
                 result_name = '{}_{:0>4}.tfrecord'.format(FLAGS.prefix, index)
                 result_path = os.path.join(FLAGS.result_dir, result_name)
