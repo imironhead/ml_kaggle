@@ -6,51 +6,47 @@ import os
 import tensorflow as tf
 
 
-def decode(example, has_strokes, has_image, has_label, image_size):
+def decode(example, has_label, image_size):
     """
     """
-    features = {}
-
-    if has_strokes:
-        features['strokes'] = tf.FixedLenFeature([], tf.string)
-
-    if has_image:
-        features['image'] = tf.FixedLenFeature([], tf.string)
+    features = {
+        'keyid': tf.FixedLenFeature([], tf.int64),
+        'strokes': tf.FixedLenFeature([], tf.string),
+        'image': tf.FixedLenFeature([], tf.string),
+    }
 
     if has_label:
         features['label'] = tf.FixedLenFeature([], tf.int64)
 
     features = tf.parse_single_example(example, features=features)
 
-    returns = []
+    keyid = features['keyid']
 
-    if has_strokes:
-        strokes = tf.decode_raw(features['strokes'], tf.float32)
+    strokes = tf.decode_raw(features['strokes'], tf.float32)
+    strokes = tf.reshape(strokes, [-1, 3])
 
-        returns.append(strokes)
+    # NOTE: strokes are padded to make batch for RNN
+    #       use length to mask the output of rnn
+    #       (set output[length:, :] to zeors)
+    length = tf.shape(strokes)[0]
 
-    if has_image:
-        image = tf.decode_raw(features['image'], tf.uint8)
-        image = tf.cast(image, tf.float32)
-        image = (image - 127.5) / 127.5
-        image = tf.reshape(image, [image_size, image_size, 1])
-
-        returns.append(image)
+    image = tf.decode_raw(features['image'], tf.uint8)
+    image = tf.cast(image, tf.float32)
+    image = (image - 127.5) / 127.5
+    image = tf.reshape(image, [image_size, image_size, 1])
 
     if has_label:
         label = tf.cast(features['label'], tf.int32)
 
-        returns.append(label)
-
-    return returns
+        return keyid, image, strokes, length, label
+    else:
+        return keyid, image, strokes, length, -1
 
 
 def build_iterator(
         record_paths,
         batch_size,
         is_training,
-        has_strokes,
-        has_image,
         has_label,
         image_size):
     """
@@ -58,8 +54,6 @@ def build_iterator(
     """
     fn_decode = functools.partial(
         decode,
-        has_strokes=has_strokes,
-        has_image=has_image,
         has_label=has_label,
         image_size=image_size)
 
@@ -81,11 +75,8 @@ def build_iterator(
     data = data.prefetch(10000)
 
     # NOTE: shape of strokes is not fixed
-    if has_strokes:
-        data = data.padded_batch(
-            batch_size=batch_size, padded_shapes=data.output_shapes)
-    else:
-        data = data.batch(batch_size=batch_size)
+    data = data.padded_batch(
+        batch_size=batch_size, padded_shapes=data.output_shapes)
 
     return data.make_initializable_iterator()
 
