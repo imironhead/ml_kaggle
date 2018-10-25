@@ -22,8 +22,9 @@ def build_dataset():
     train_iterator = dataset_iterator.build_iterator(
         train_record_paths,
         batch_size=FLAGS.batch_size,
-        is_training=True,
         has_label=True,
+        is_training=True,
+        is_recognized_only=FLAGS.train_on_recognized,
         image_size=FLAGS.image_size)
 
     # NOTE: iterator for validation dataset
@@ -32,8 +33,9 @@ def build_dataset():
     valid_iterator = dataset_iterator.build_iterator(
         valid_record_paths,
         batch_size=FLAGS.batch_size,
-        is_training=False,
         has_label=True,
+        is_training=False,
+        is_recognized_only=False,
         image_size=FLAGS.image_size)
 
     # NOTE: iterator for testing dataset
@@ -42,8 +44,9 @@ def build_dataset():
     test_iterator = dataset_iterator.build_iterator(
         test_record_paths,
         batch_size=FLAGS.batch_size,
-        is_training=False,
         has_label=False,
+        is_training=False,
+        is_recognized_only=False,
         image_size=FLAGS.image_size)
 
     # NOTE: a string handle as training/validation set switch
@@ -55,7 +58,7 @@ def build_dataset():
         train_iterator.output_shapes)
 
     # NOTE: create an op to iterate the datasets
-    keyids, images, strokes, lengths, labels = iterator.get_next()
+    keyids, images, strokes, lengths, recognized, labels = iterator.get_next()
 
     return {
         'keyids': keyids,
@@ -84,6 +87,8 @@ def build_model(data):
         import qdraw.model_resnet as chosen_model
     elif FLAGS.model == 'mobilenets':
         import qdraw.model_mobilenets as chosen_model
+    elif FLAGS.model == 'mobilenets_v2':
+        import qdraw.model_mobilenets_v2 as chosen_model
 
     return chosen_model.build_model(
         data['images'],
@@ -347,6 +352,7 @@ if __name__ == '__main__':
     tf.app.flags.DEFINE_string('result_zip_path', None, '')
 
     tf.app.flags.DEFINE_boolean('save_checkpoint', False, '')
+    tf.app.flags.DEFINE_boolean('train_on_recognized', False, '')
 
     tf.app.flags.DEFINE_integer('image_size', 28, '')
     tf.app.flags.DEFINE_integer('batch_size', 100, '')

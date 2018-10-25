@@ -16,14 +16,17 @@ def decode(example, has_label, image_size):
     }
 
     if has_label:
+        features['recognized'] = tf.FixedLenFeature([], tf.int64)
         features['label'] = tf.FixedLenFeature([], tf.int64)
 
     features = tf.parse_single_example(example, features=features)
 
     keyid = features['keyid']
 
-    strokes = tf.decode_raw(features['strokes'], tf.float32)
+    strokes = tf.decode_raw(features['strokes'], tf.uint8)
+    strokes = tf.cast(strokes, tf.float32)
     strokes = tf.reshape(strokes, [-1, 3])
+    strokes = strokes / 255.0
 
     # NOTE: strokes are padded to make batch for RNN
     #       use length to mask the output of rnn
@@ -32,22 +35,24 @@ def decode(example, has_label, image_size):
 
     image = tf.decode_raw(features['image'], tf.uint8)
     image = tf.cast(image, tf.float32)
-    image = (image - 127.5) / 127.5
     image = tf.reshape(image, [image_size, image_size, 1])
+    image = image / 255.0
 
     if has_label:
+        recognized = tf.cast(features['recognized'], tf.int32)
         label = tf.cast(features['label'], tf.int32)
 
-        return keyid, image, strokes, length, label
+        return keyid, image, strokes, length, recognized, label
     else:
-        return keyid, image, strokes, length, -1
+        return keyid, image, strokes, length, -1, -1
 
 
 def build_iterator(
         record_paths,
         batch_size,
-        is_training,
         has_label,
+        is_training,
+        is_recognized_only,
         image_size):
     """
     read TFRecord batch.
@@ -71,6 +76,9 @@ def build_iterator(
         data = tf.data.TFRecordDataset(data)
 
     data = data.map(fn_decode)
+
+    if is_recognized_only:
+        data = data.filter(lambda a, b, c, d, e, f: tf.equal(e, 1))
 
     data = data.prefetch(10000)
 
