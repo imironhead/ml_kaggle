@@ -3,17 +3,18 @@
 import tensorflow as tf
 
 
-def bottleneck(
+def block(
         tensors,
-        num_filters_in,
-        num_filters_out,
         expansion,
         stride,
+        filters,
         training,
         scope_name):
     """
     """
     initializer = tf.truncated_normal_initializer(stddev=0.02)
+
+    num_filters_in = tensors.shape[-1]
 
     source_tensors = tensors
 
@@ -24,138 +25,115 @@ def bottleneck(
             kernel_size=1,
             strides=1,
             padding='same',
-            data_format='channels_last',
-            activation=tf.nn.relu,
-            use_bias=True,
+            activation=None,
+            use_bias=False,
             kernel_initializer=initializer,
             name='head')
 
-        tensors = tf.contrib.slim.batch_norm(tensors, is_training=training)
+        tensors = tf.layers.batch_normalization(tensors, training=training)
 
-        tensors = tf.contrib.slim.separable_convolution2d(
+        tensors = tf.nn.relu(tensors)
+
+        filter_weights = tf.get_variable(
+            'depthwise_conv_filter',
+            [3, 3, num_filters_in * expansion, 1],
+            initializer=initializer,
+            dtype=tf.float32)
+
+        tensors = tf.nn.depthwise_conv2d(
             tensors,
-            num_outputs=None,
-            stride=stride,
-            depth_multiplier=1,
-            kernel_size=[3, 3],
-            scope='depthwise')
+            filter_weights,
+            strides=[1, stride, stride, 1],
+            padding='SAME',
+            rate=[1, 1],
+            name='depthwise_conv')
 
-        tensors = tf.contrib.slim.batch_norm(tensors, is_training=training)
+        tensors = tf.layers.batch_normalization(tensors, training=training)
+
+        tensors = tf.nn.relu(tensors)
 
         tensors = tf.layers.conv2d(
             tensors,
-            filters=num_filters_out,
+            filters=filters,
             kernel_size=1,
             strides=1,
             padding='same',
-            data_format='channels_last',
             activation=None,
-            use_bias=True,
+            use_bias=False,
             kernel_initializer=initializer,
             name='tail')
 
-        if stride == 1:
-            if num_filters_in != num_filters_out:
-                source_tensors = tf.layers.conv2d(
-                    source_tensors,
-                    filters=num_filters_out,
-                    kernel_size=1,
-                    strides=1,
-                    padding='same',
-                    data_format='channels_last',
-                    activation=None,
-                    use_bias=False,
-                    kernel_initializer=initializer,
-                    name='scale')
+        tensors = tf.layers.batch_normalization(tensors, training=training)
 
+        if stride == 1 and num_filters_in == filters:
             tensors = tf.add(tensors, source_tensors)
 
     return tensors
 
 
-def bottlenecks(
-        tensors,
-        num_filters_in,
-        num_filters_out,
-        expansion,
-        stride,
-        repeat,
-        training,
-        scope_name):
-    """
-    """
-    with tf.variable_scope(scope_name):
-        tensors = bottleneck(
-            tensors,
-            num_filters_in,
-            num_filters_out,
-            expansion,
-            stride,
-            training,
-            'block_0')
-
-        for index in range(1, repeat):
-            tensors = bottleneck(
-                tensors,
-                num_filters_in,
-                num_filters_out,
-                expansion,
-                1,
-                training,
-                'block_{}'.format(index))
-
-    return tensors
-
-
-def build_model(images, strokes, lengths, labels):
+def build_model(images, strokes, lengths, labels, training):
     """
     """
     initializer = tf.truncated_normal_initializer(stddev=0.02)
-
-    training = tf.placeholder(shape=[], dtype=tf.bool)
 
     tensors = images
 
     tensors = tf.layers.conv2d(
         tensors,
-        filters=64,
+        filters=32,
         kernel_size=3,
-        strides=1,
+        strides=2,
         padding='same',
-        data_format='channels_last',
-        activation=tf.nn.relu,
+        activation=None,
         use_bias=True,
         kernel_initializer=initializer,
         name='conv_in')
 
-    # NOTE: num_filters_in, num_filters_out, expansion, stride, repeat, name
+    tensors = tf.layers.batch_normalization(tensors, training=training)
+
+    tensors = tf.nn.relu(tensors)
+
+    # NOTE: expansion, stride, filters, training, name
     block_configs = [
-#       (64, 64, 1, 1, 2, training, 'bottleneck_0'),
-        (64, 128, 1, 2, 2, training, 'bottleneck_1'),
-#       (128, 128, 1, 1, 4, training, 'bottleneck_2'),
-        (128, 256, 1, 2, 4, training, 'bottleneck_3'),
-#       (256, 256, 1, 1, 4, training, 'bottleneck_4'),
-        (256, 512, 1, 2, 4, training, 'bottleneck_5'),
-#       (512, 512, 1, 1, 4, training, 'bottleneck_6'),
-        (512, 1024, 1, 2, 4, training, 'bottleneck_7'),
+        (1, 1, 16, training, 'block_0'),
+        (6, 2, 24, training, 'block_1'),
+        (6, 1, 24, training, 'block_2'),
+        (6, 2, 32, training, 'block_3'),
+        (6, 1, 32, training, 'block_4'),
+        (6, 1, 32, training, 'block_5'),
+        (6, 2, 64, training, 'block_6'),
+        (6, 1, 64, training, 'block_7'),
+        (6, 1, 64, training, 'block_8'),
+        (6, 1, 64, training, 'block_9'),
+        (6, 1, 96, training, 'block_10'),
+        (6, 1, 96, training, 'block_11'),
+        (6, 1, 96, training, 'block_12'),
+        (6, 2, 160, training, 'block_13'),
+        (6, 1, 160, training, 'block_14'),
+        (6, 1, 160, training, 'block_15'),
+        (6, 1, 320, training, 'block_16'),
     ]
 
     for params in block_configs:
-        tensors = bottlenecks(tensors, *params)
+        tensors = block(tensors, *params)
 
     tensors = tf.layers.conv2d(
         tensors,
-        filters=2048,
+        filters=1280,
         kernel_size=1,
         strides=1,
         padding='same',
-        data_format='channels_last',
-        activation=tf.nn.relu,
-        use_bias=True,
+        activation=None,
+        use_bias=False,
         kernel_initializer=initializer,
-        name='bottleneck_final')
+        name='block_final')
 
-    tensors = tf.nn.avg_pool(tensors, [1, 4, 4, 1], [1, 4, 4, 1], padding='SAME')
+    tensors = tf.layers.batch_normalization(tensors, training=training)
+
+    tensors = tf.nn.relu(tensors)
+
+    tensors = \
+        tf.nn.avg_pool(tensors, [1, 2, 2, 1], [1, 2, 2, 1], padding='SAME')
 
     # NOTE: flatten for fc
     tensors = tf.layers.flatten(tensors)
@@ -169,32 +147,10 @@ def build_model(images, strokes, lengths, labels):
         kernel_initializer=initializer,
         name='final')
 
-    logits = tf.identity(logits, name='logits')
-
-    # NOTE: build a simplier model without traning op
-    if labels is None:
-        return {
-            'images': images,
-            'strokes': strokes,
-            'lengths': lengths,
-            'logits': logits,
-        }
-
     loss = tf.losses.sparse_softmax_cross_entropy(
         labels,
         logits,
         reduction=tf.losses.Reduction.SUM_OVER_BATCH_SIZE)
-
-    step = tf.train.get_or_create_global_step()
-
-    learning_rate = tf.placeholder(shape=[], dtype=tf.float32)
-
-    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-
-    with tf.control_dependencies(update_ops):
-        optimizer = tf.train \
-            .AdamOptimizer(learning_rate=learning_rate) \
-            .minimize(loss, global_step=step)
 
     return {
         'images': images,
@@ -203,9 +159,5 @@ def build_model(images, strokes, lengths, labels):
         'lengths': lengths,
         'logits': logits,
         'loss': loss,
-        'step': step,
-        'training': training,
-        'optimizer': optimizer,
-        'learning_rate': learning_rate,
     }
 

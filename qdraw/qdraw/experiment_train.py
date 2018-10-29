@@ -3,6 +3,7 @@
 import csv
 import gzip
 import os
+import time
 
 import numpy as np
 import tensorflow as tf
@@ -11,123 +12,112 @@ import qdraw.dataset as dataset
 import qdraw.dataset_iterator as dataset_iterator
 
 
-def build_dataset():
-    """
-    """
-    FLAGS = tf.app.flags.FLAGS
-
-    # NOTE: for changing dataset during training
-    train_record_paths = tf.placeholder(tf.string, shape=[None])
-
-    train_iterator = dataset_iterator.build_iterator(
-        train_record_paths,
-        batch_size=FLAGS.batch_size,
-        has_label=True,
-        is_training=True,
-        is_recognized_only=FLAGS.train_on_recognized,
-        image_size=FLAGS.image_size)
-
-    # NOTE: iterator for validation dataset
-    valid_record_paths = [FLAGS.valid_tfr_path]
-
-    valid_iterator = dataset_iterator.build_iterator(
-        valid_record_paths,
-        batch_size=FLAGS.batch_size,
-        has_label=True,
-        is_training=False,
-        is_recognized_only=False,
-        image_size=FLAGS.image_size)
-
-    # NOTE: iterator for testing dataset
-    test_record_paths = [FLAGS.test_tfr_path]
-
-    test_iterator = dataset_iterator.build_iterator(
-        test_record_paths,
-        batch_size=FLAGS.batch_size,
-        has_label=False,
-        is_training=False,
-        is_recognized_only=False,
-        image_size=FLAGS.image_size)
-
-    # NOTE: a string handle as training/validation set switch
-    dataset_handle = tf.placeholder(tf.string, shape=[])
-
-    iterator = tf.data.Iterator.from_string_handle(
-        dataset_handle,
-        train_iterator.output_types,
-        train_iterator.output_shapes)
-
-    # NOTE: create an op to iterate the datasets
-    keyids, images, strokes, lengths, recognized, labels = iterator.get_next()
-
-    return {
-        'keyids': keyids,
-        'images': images,
-        'strokes': strokes,
-        'lengths': lengths,
-        'labels': labels,
-        'train_iterator': train_iterator,
-        'valid_iterator': valid_iterator,
-        'test_iterator': test_iterator,
-        'dataset_handle': dataset_handle,
-        'train_record_paths': train_record_paths,
-    }
-
-
 def build_model(data):
     """
     """
     FLAGS = tf.app.flags.FLAGS
 
-    if FLAGS.model == 'cnn':
-        import qdraw.model_cnn as chosen_model
-    elif FLAGS.model == 'rnn':
-        import qdraw.model_rnn as chosen_model
-    elif FLAGS.model == 'resnet':
-        import qdraw.model_resnet as chosen_model
-    elif FLAGS.model == 'mobilenets':
+    if FLAGS.model == 'mobilenets':
         import qdraw.model_mobilenets as chosen_model
     elif FLAGS.model == 'mobilenets_v2':
         import qdraw.model_mobilenets_v2 as chosen_model
 
-    return chosen_model.build_model(
-        data['images'],
-        data['strokes'],
-        data['lengths'],
-        data['labels'])
+    with tf.device('/cpu:0'):
+        # NOTE:
+        step = tf.train.get_or_create_global_step()
 
+        # NOTE:
+        training = tf.placeholder(shape=[], dtype=tf.bool)
 
-def build_summaries(model):
-    """
-    """
+        # NOTE:
+        learning_rate = tf.placeholder(shape=[], dtype=tf.float32)
+
+        # NOTE:
+        optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
+
+    losses = []
+    tower_grads = []
+
+#   with tf.variable_scope(tf.get_variable_scope()):
+    for i in range(FLAGS.num_gpus):
+        keyids, images, strokes, lengths, labels = \
+            data['iterator'].get_next()
+
+        with tf.variable_scope('ngpus', reuse=tf.AUTO_REUSE):
+            with tf.device('/gpu:{}'.format(i)):
+                with tf.name_scope('qdraw_{}'.format(i)) as scope:
+                    model = chosen_model.build_model(
+                        images, strokes, lengths, labels, training)
+
+                    losses.append(model['loss'])
+
+                    # NOTE: am I right?
+                    update_ops = \
+                        tf.get_collection(tf.GraphKeys.UPDATE_OPS, scope)
+
+                    with tf.control_dependencies(update_ops):
+                        grads = optimizer.compute_gradients(model['loss'])
+
+                    tower_grads.append(grads)
+
+                    # NOTE: all data go through a single gpu for inference
+                    if i == 0:
+                        keyids = keyids
+                        labels = model['labels']
+                        logits = model['logits']
+
+    with tf.device('/cpu:0'):
+        # NOTE: aggregate losses
+        loss = tf.stack(losses)
+        loss = tf.reduce_mean(loss, 0)
+
+        # NOTE: aggregate gradients
+        average_grads = []
+
+        for grad_and_vars in zip(*tower_grads):
+            grad = tf.stack([g for g, v in grad_and_vars])
+            grad = tf.reduce_mean(grad, 0)
+
+            average_grads.append((grad, grad_and_vars[0][1]))
+
+        # NOTE:
+        op_apply_gradient = \
+            optimizer.apply_gradients(average_grads, global_step=step)
+
     return {
-        'loss': tf.summary.scalar('loss', model['loss']),
+        'step': step,
+        'loss': loss,
+        'keyids': keyids,
+        'labels': labels,
+        'logits': logits,
+        'training': training,
+        'learning_rate': learning_rate,
+        'optimizer': op_apply_gradient,
+        'dataset_handle': data['dataset_handle'],
     }
 
 
-def train(session, step, model, data, dataset_handle, summaries, reporter):
+def train(session, model, dataset_handle):
     """
     """
     FLAGS = tf.app.flags.FLAGS
 
+    # NOTE: decay policy?
+    learning_rate = FLAGS.initial_learning_rate
+
     feeds = {
-        data['dataset_handle']: dataset_handle,
-        model['learning_rate']: FLAGS.initial_learning_rate,
+        model['dataset_handle']: dataset_handle,
+        model['learning_rate']: learning_rate,
+        model['training']: True,
     }
 
     fetch = {
         'optimizer': model['optimizer'],
         'loss': model['loss'],
         'step': model['step'],
-        'summary': summaries['loss'],
     }
 
-    if 'training' in model:
-        feeds[model['training']] = True
-
     fetched = session.run(fetch, feed_dict=feeds)
-
-    reporter.add_summary(fetched['summary'], fetched['step'])
 
     if fetched['step'] % 1000 == 0:
         print('loss[{}]: {}'.format(fetched['step'], fetched['loss']))
@@ -135,9 +125,11 @@ def train(session, step, model, data, dataset_handle, summaries, reporter):
     return fetched['step']
 
 
-def valid(session, step, model, data, dataset_handle, summaries, reporter):
+def valid(session, model, data, dataset_handle):
     """
     """
+    step = session.run(model['step'])
+
     if step % 10000 != 0:
         return step
 
@@ -149,16 +141,14 @@ def valid(session, step, model, data, dataset_handle, summaries, reporter):
     while True:
         try:
             feeds = {
-                data['dataset_handle']: dataset_handle,
+                model['dataset_handle']: dataset_handle,
+                model['training']: False,
             }
 
             fetch = {
                 'labels': model['labels'],
                 'logits': model['logits'],
             }
-
-            if 'training' in model:
-                feeds[model['training']] = False
 
             fetched = session.run(fetch, feed_dict=feeds)
 
@@ -176,12 +166,6 @@ def valid(session, step, model, data, dataset_handle, summaries, reporter):
             break
 
     map_at_3 = sum(aps) / float(num_images)
-
-    summaries = [tf.Summary.Value(tag='map', simple_value=map_at_3)]
-
-    summaries = tf.Summary(value=summaries)
-
-    reporter.add_summary(summaries, step)
 
     print('validation at step: {}'.format(step))
     print('map_1: {}'.format(aps[0] / float(num_images)))
@@ -206,16 +190,14 @@ def test(session, model, data, dataset_handle):
     while True:
         try:
             feeds = {
-                data['dataset_handle']: dataset_handle,
+                model['dataset_handle']: dataset_handle,
+                model['training']: False,
             }
 
             fetch = {
-                'keyids': data['keyids'],
+                'keyids': model['keyids'],
                 'logits': model['logits'],
             }
-
-            if 'training' in model:
-                feeds[model['training']] = False
 
             fetched = session.run(fetch, feed_dict=feeds)
 
@@ -247,28 +229,25 @@ def test(session, model, data, dataset_handle):
 
                 writer.writerow([keyid, predictions])
 
+        print('done: {}'.format(FLAGS.result_zip_path))
+
 
 def main(_):
     """
     """
     FLAGS = tf.app.flags.FLAGS
 
-    data = build_dataset()
+    data = dataset_iterator.build_dataset(
+        batch_size=FLAGS.batch_size,
+        image_size=FLAGS.image_size,
+        valid_dir_path=FLAGS.valid_dir_path,
+        test_dir_path=FLAGS.test_dir_path,
+        train_on_recognized=FLAGS.train_on_recognized)
 
     model = build_model(data)
 
-    summaries = build_summaries(model)
-
-    reporter = tf.summary.FileWriter(FLAGS.logs_path)
-
     with tf.Session() as session:
         session.run(tf.global_variables_initializer())
-
-        step = session.run(model['step'])
-
-        # NOTE: exclude log which does not happend yet :)
-        reporter.add_session_log(
-            tf.SessionLog(status=tf.SessionLog.START), global_step=step)
 
         # NOTE: initialize dataset iterator
         train_record_paths = tf.gfile.ListDirectory(FLAGS.train_dir_path)
@@ -285,75 +264,43 @@ def main(_):
         valid_handle = session.run(data['valid_iterator'].string_handle())
         test_handle = session.run(data['test_iterator'].string_handle())
 
-        while True:
-            step = train(
-                session,
-                step,
-                model,
-                data,
-                train_handle,
-                summaries,
-                reporter)
+        ts = time.clock()
 
-            step = valid(
-                session,
-                step,
-                model,
-                data,
-                valid_handle,
-                summaries,
-                reporter)
+        while True:
+            step = train(session, model, train_handle)
+
+            step = valid(session, model, data, valid_handle)
+
+            if step % 1000 == 0:
+                t = time.clock()
+
+                print('[gpux{}] 1000 steps take {} seconds'.format(
+                    FLAGS.num_gpus, t - ts))
+
+                ts = t
 
             if step >= FLAGS.stop_at_step:
                 break
 
         test(session, model, data, test_handle)
 
-        if not FLAGS.save_checkpoint:
-            return
-
-        target_ckpt_path = os.path.join(FLAGS.ckpt_path, 'model.ckpt')
-
-        tf.train.Saver().save(
-            session, target_ckpt_path, write_meta_graph=False)
-
-    # NOTE: save meta, replace dataset with placeholder
-    tf.reset_default_graph()
-
-    data['images'] = tf.placeholder(
-        tf.float32,
-        shape=[None, FLAGS.image_size, FLAGS.image_size, 1],
-        name='images')
-    data['strokes'] = tf.placeholder(
-        tf.float32,
-        shape=[None, None, 3],
-        name='strokes')
-    data['lengths'] = tf.placeholder(
-        tf.int32,
-        shape=[None],
-        name='lengths')
-    data['labels'] = None
-
-    model = build_model(data)
-
-    tf.train.Saver().export_meta_graph(target_ckpt_path + '.meta')
-
 
 if __name__ == '__main__':
     tf.app.flags.DEFINE_string('train_dir_path', None, '')
-    tf.app.flags.DEFINE_string('valid_tfr_path', None, '')
+    tf.app.flags.DEFINE_string('valid_dir_path', None, '')
     tf.app.flags.DEFINE_string('ckpt_path', None, '')
     tf.app.flags.DEFINE_string('logs_path', None, '')
     tf.app.flags.DEFINE_string('model', None, '')
     tf.app.flags.DEFINE_string('learning_rate_policy', None, '')
     tf.app.flags.DEFINE_string('dataset_rotate_policy', None, '')
 
-    tf.app.flags.DEFINE_string('test_tfr_path', None, '')
+    tf.app.flags.DEFINE_string('test_dir_path', None, '')
     tf.app.flags.DEFINE_string('result_zip_path', None, '')
 
     tf.app.flags.DEFINE_boolean('save_checkpoint', False, '')
     tf.app.flags.DEFINE_boolean('train_on_recognized', False, '')
 
+    tf.app.flags.DEFINE_integer('num_gpus', 1, '')
     tf.app.flags.DEFINE_integer('image_size', 28, '')
     tf.app.flags.DEFINE_integer('batch_size', 100, '')
 

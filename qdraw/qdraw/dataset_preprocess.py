@@ -69,12 +69,26 @@ def strokes_to_series(strokes):
 
 def strokes_to_image(strokes, image_size):
     """
+    import cv2
+
+    image = np.zeros((256, 256), dtype=np.uint8)
+
+    for t, (xs, ys) in enumerate(strokes):
+        color = 255 - min(t, 10) * 13
+
+        for i in range(1, len(xs)):
+            cv2.line(image, (xs[i-1], ys[i-1]), (xs[i], ys[i]), color, 6)
+
+    if image_size != 256:
+        image = cv2.resize(image, (image_size, image_size))
     """
     scale = 256 // image_size
 
     image = np.zeros((image_size, image_size), dtype=np.uint8)
 
-    for xs, ys in strokes:
+    for t, (xs, ys) in enumerate(strokes):
+        color = 255 - min(t, 10) * 13
+
         for i in range(1, len(xs)):
             rr, cc, val = skimage.draw.line_aa(
                 ys[i-1] // scale,
@@ -82,7 +96,7 @@ def strokes_to_image(strokes, image_size):
                 ys[i] // scale,
                 xs[i] // scale)
 
-            image[rr, cc] = val * 255
+            image[rr, cc] = val * color
 
     return image.flatten().tostring()
 
@@ -104,9 +118,6 @@ def raw_feature(v):
 def row_to_example_training(row, image_size):
     """
     """
-    # NOTE: country
-#   country = dataset.country_to_index[row[0]]
-
     # NOTE: strokes
     strokes = json.loads(row[1])
 
@@ -130,10 +141,9 @@ def row_to_example_training(row, image_size):
 
     # NOTE: make example
     feature = {
-#       'country': int64_feature(country),
+        'keyid': int64_feature(keyid),
         'strokes': raw_feature(series),
         'image': raw_feature(image),
-        'keyid': int64_feature(keyid),
         'recognized': int64_feature(recognized),
         'label': int64_feature(label),
     }
@@ -146,9 +156,6 @@ def row_to_example_testing(row, image_size):
     """
     # NOTE: key id
     keyid = int(row[0])
-
-    # NOTE: country
-#   country = dataset.country_to_index[row[1]]
 
     # NOTE: strokes
     strokes = json.loads(row[2])
@@ -163,9 +170,10 @@ def row_to_example_testing(row, image_size):
     # NOTE: make example
     feature = {
         'keyid': int64_feature(keyid),
-#       'country': int64_feature(country),
         'strokes': raw_feature(series),
         'image': raw_feature(image),
+        'recognized': int64_feature(-1),
+        'label': int64_feature(-1),
     }
 
     return tf.train.Example(features=tf.train.Features(feature=feature))
@@ -198,8 +206,13 @@ def preprocess(description):
     if description['shuffle']:
         random.shuffle(examples)
 
-    # NOTE: load images
-    with tf.python_io.TFRecordWriter(description['result_path']) as writer:
+    # NOTE: write gzip
+    options = tf.python_io.TFRecordOptions(
+        tf.python_io.TFRecordCompressionType.GZIP)
+
+    result_path = description['result_path']
+
+    with tf.python_io.TFRecordWriter(result_path, options=options) as writer:
         for example in examples:
             writer.write(example.SerializeToString())
 
@@ -247,7 +260,7 @@ def preprocess_training():
 
         for i in range(FLAGS.num_output):
             # NOTE: build result name with prefix and index
-            result_name = '{}_{:0>4}.tfrecord'.format(FLAGS.prefix, i)
+            result_name = '{}_{:0>4}.tfrecord.gz'.format(FLAGS.prefix, i)
             result_path = os.path.join(FLAGS.result_dir, result_name)
 
             # NOTE: collect csv from different categories
