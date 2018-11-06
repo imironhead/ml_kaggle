@@ -2,6 +2,7 @@
 """
 import csv
 import functools
+import itertools
 import json
 import multiprocessing.dummy
 import os
@@ -13,6 +14,37 @@ import skimage.io
 import tensorflow as tf
 
 import qdraw.dataset as dataset
+
+
+def perturb_strokes(strokes):
+    """
+    """
+    lt = np.random.randint(8, size=2)
+    lb = np.random.randint(8, size=2) + np.array([0, 248])
+    rt = np.random.randint(8, size=2) + np.array([248, 0])
+    rb = np.random.randint(8, size=2) + np.array([248, 248])
+
+    new_strokes = []
+
+    for xs, ys in strokes:
+        new_xs = []
+        new_ys = []
+
+        for x, y in zip(xs, ys):
+            p = \
+                lt * (256 - x) * (256 - y) + \
+                lb * (256 - x) * y + \
+                rt * (256 - y) * x + \
+                rb * x * y
+
+            p //= 65536
+
+            new_xs.append(p[0])
+            new_ys.append(p[1])
+
+        new_strokes.append([new_xs, new_ys])
+
+    return new_strokes
 
 
 def center_strokes(strokes):
@@ -115,7 +147,7 @@ def raw_feature(v):
     return tf.train.Feature(bytes_list=tf.train.BytesList(value=[v]))
 
 
-def row_to_example_training(row, image_size):
+def row_to_example_training(row, image_size, perturb):
     """
     """
     # NOTE: strokes
@@ -131,6 +163,10 @@ def row_to_example_training(row, image_size):
 
     # NOTE: label, replace space with _ for kaggle quick draw competition
     label = dataset.label_to_index[row[5].replace(' ', '_')]
+
+    # NOTE:
+    if perturb:
+        strokes = perturb_strokes(strokes)
 
     # NOTE: process strokes
     strokes = center_strokes(strokes)
@@ -151,7 +187,7 @@ def row_to_example_training(row, image_size):
     return tf.train.Example(features=tf.train.Features(feature=feature))
 
 
-def row_to_example_testing(row, image_size):
+def row_to_example_testing(row, image_size, perturb):
     """
     """
     # NOTE: key id
@@ -159,6 +195,10 @@ def row_to_example_testing(row, image_size):
 
     # NOTE: strokes
     strokes = json.loads(row[2])
+
+    # NOTE:
+    if perturb:
+        strokes = perturb_strokes(strokes)
 
     # NOTE: process strokes
     strokes = center_strokes(strokes)
@@ -179,44 +219,27 @@ def row_to_example_testing(row, image_size):
     return tf.train.Example(features=tf.train.Features(feature=feature))
 
 
-def row_to_example(row, image_size):
+def row_to_example(row, image_size, perturb):
     """
     """
     if len(row) == 6:
-        return row_to_example_training(row, image_size)
+        return row_to_example_training(row, image_size, perturb)
     elif len(row) == 3:
-        return row_to_example_testing(row, image_size)
+        return row_to_example_testing(row, image_size, perturb)
 
 
 def preprocess(description):
     """
     """
     fn_row_to_example = functools.partial(
-        row_to_example, image_size=description['image_size'])
+        row_to_example,
+        image_size=description['image_size'],
+        perturb=description['perturb'])
 
-    examples = []
+    with open(description['source_path'], newline='') as csv_file:
+        rows = csv.reader(csv_file, delimiter=',')
 
-    for source_path in description['source_paths']:
-        with open(source_path, newline='') as csv_file:
-            rows = csv.reader(csv_file, delimiter=',')
-
-            examples.extend([fn_row_to_example(row) for row in rows])
-
-    # NOTE: no shuffling for testing set
-    if description['shuffle']:
-        random.shuffle(examples)
-
-    # NOTE: write gzip
-    options = tf.python_io.TFRecordOptions(
-        tf.python_io.TFRecordCompressionType.GZIP)
-
-    result_path = description['result_path']
-
-    with tf.python_io.TFRecordWriter(result_path, options=options) as writer:
-        for example in examples:
-            writer.write(example.SerializeToString())
-
-    print('done: {}'.format(description['result_path']))
+        return [fn_row_to_example(row) for row in rows]
 
 
 def collect_source_path_generators():
@@ -256,32 +279,37 @@ def preprocess_training():
     source_path_generators = collect_source_path_generators()
 
     with multiprocessing.dummy.Pool(8) as pool:
-        descriptions = []
-
         for i in range(FLAGS.num_output):
+            descriptions = []
+
+            # NOTE: collect csv from different categories
+            for path_generator in source_path_generators:
+                descriptions.append({
+                    'source_path': next(path_generator),
+                    'image_size': FLAGS.image_size,
+                    'perturb': FLAGS.perturb})
+
+            example_groups = pool.map(preprocess, descriptions)
+
+            examples = list(itertools.chain.from_iterable(example_groups))
+
+            # NOTE: no shuffling for testing set
+            if FLAGS.shuffle:
+                random.shuffle(examples)
+
             # NOTE: build result name with prefix and index
             result_name = '{}_{:0>4}.tfrecord.gz'.format(FLAGS.prefix, i)
             result_path = os.path.join(FLAGS.result_dir, result_name)
 
-            # NOTE: collect csv from different categories
-            description = {
-                'source_paths': [next(g) for g in source_path_generators],
-                'result_path': result_path,
-                'image_size': FLAGS.image_size,
-                'shuffle': True,
-            }
+            # NOTE: write gzip
+            options = tf.python_io.TFRecordOptions(
+                tf.python_io.TFRecordCompressionType.GZIP)
 
-            descriptions.append(description)
+            with tf.python_io.TFRecordWriter(result_path, options=options) as writer:
+                for example in examples:
+                    writer.write(example.SerializeToString())
 
-            # NOTE: batch pre-process
-            if len(descriptions) >= 8:
-                pool.map(preprocess, descriptions)
-
-                descriptions = []
-
-        if len(descriptions) > 0:
-            pool.map(preprocess, descriptions)
-
+            print('done: {}'.format(result_path))
 
 
 def preprocess_testing():
@@ -290,13 +318,22 @@ def preprocess_testing():
     FLAGS = tf.app.flags.FLAGS
 
     description = {
-        'source_paths': [FLAGS.source_csv_path],
-        'result_path': FLAGS.result_tfr_path,
+        'source_path': FLAGS.source_csv_path,
         'image_size': FLAGS.image_size,
-        'shuffle': False,
+        'perturb': FLAGS.perturb,
     }
 
-    preprocess(description)
+    examples = preprocess(description)
+
+    # NOTE: write gzip
+    options = tf.python_io.TFRecordOptions(
+        tf.python_io.TFRecordCompressionType.GZIP)
+
+    with tf.python_io.TFRecordWriter(FLAGS.result_tfr_path, options=options) as writer:
+        for example in examples:
+            writer.write(example.SerializeToString())
+
+    print('done: {}'.format(FLAGS.result_tfr_path))
 
 
 def main(_):
@@ -321,6 +358,7 @@ if __name__ == '__main__':
 
     tf.app.flags.DEFINE_string('prefix', '', '')
 
+    tf.app.flags.DEFINE_boolean('perturb', False, '')
     tf.app.flags.DEFINE_boolean('shuffle', False, '')
 
     tf.app.flags.DEFINE_integer('image_size', 32, '')

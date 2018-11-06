@@ -73,8 +73,6 @@ def build_iterator(
     if is_recognized_only:
         data = data.filter(lambda a, b, c, d, e, f: tf.equal(e, 1))
 
-    data = data.map(lambda a, b, c, d, e, f: (a, b, c, d, f))
-
     data = data.prefetch(10000)
 
     # NOTE: shape of strokes is not fixed
