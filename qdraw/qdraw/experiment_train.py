@@ -12,19 +12,10 @@ import qdraw.dataset as dataset
 import qdraw.dataset_iterator as dataset_iterator
 
 
-def build_model(data):
+def build_model_replica(chosen_model, data):
     """
     """
     FLAGS = tf.app.flags.FLAGS
-
-    if FLAGS.model == 'mobilenets':
-        import qdraw.model_mobilenets as chosen_model
-    elif FLAGS.model == 'mobilenets_v2':
-        import qdraw.model_mobilenets_v2 as chosen_model
-    elif FLAGS.model == 'blind':
-        import qdraw.model_blind as chosen_model
-    elif FLAGS.model == 'null':
-        import qdraw.model_null as chosen_model
 
     with tf.device('/cpu:0'):
         # NOTE:
@@ -50,7 +41,9 @@ def build_model(data):
             with tf.name_scope('qdraw_{}'.format(i)) as scope:
 
                 device_setter = tf.train.replica_device_setter(
-                    worker_device='/gpu:{}'.format(i), ps_device='/cpu:0', ps_tasks=1)
+                    worker_device='/gpu:{}'.format(i),
+                    ps_device='/cpu:0',
+                    ps_tasks=1)
 
                 with tf.device(device_setter):
                     model = chosen_model.build_model(
@@ -92,28 +85,108 @@ def build_model(data):
             optimizer.apply_gradients(average_grads, global_step=step)
 
     return {
-        'step': step,
-        'loss': loss,
         'keyids': keyids,
         'labels': labels,
-        'logits': logits,
         'recognized': recognized,
+
+        'step': step,
         'training': training,
         'learning_rate': learning_rate,
-        'optimizer': op_apply_gradient,
         'dataset_handle': data['dataset_handle'],
+
+        'loss': loss,
+        'logits': logits,
+        'optimizer': op_apply_gradient,
     }
 
 
-def build_summaries(model):
+def build_model_single(chosen_model, data):
     """
     """
-    return {
-        'train_loss': tf.summary.scalar('train_loss', model['loss']),
+    FLAGS = tf.app.flags.FLAGS
+
+    # NOTE:
+    step = tf.train.get_or_create_global_step()
+
+    # NOTE:
+    training = tf.placeholder(shape=[], dtype=tf.bool)
+
+    # NOTE:
+    learning_rate = tf.placeholder(shape=[], dtype=tf.float32)
+
+    # NOTE:
+    optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
+
+    #
+    keyids, images, strokes, lengths, recognized, labels = \
+        data['iterator'].get_next()
+
+    model = chosen_model.build_model(
+        images, strokes, lengths, labels, training)
+
+    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+
+    new_model = {
+        'keyids': keyids,
+        'labels': labels,
+        'recognized': recognized,
+
+        'step': step,
+        'training': training,
+        'learning_rate': learning_rate,
+        'dataset_handle': data['dataset_handle'],
+
+        'loss': model['loss'],
+        'logits': model['logits'],
     }
 
+    if FLAGS.batch_multiplier > 1:
+        def placeholder(g):
+            return tf.placeholder(shape=g.shape, dtype=g.dtype)
 
-def train(session, model, dataset_handle, summaries, reporter):
+        with tf.control_dependencies(update_ops):
+            gradients_and_vars = optimizer.compute_gradients(model['loss'])
+
+        avg_gradients_and_vars = \
+            [(placeholder(g), v) for g, v in gradients_and_vars]
+
+        new_model['gradients_source'] = [g for g, v in avg_gradients_and_vars]
+
+        new_model['gradients_result'] = [g for g, v in gradients_and_vars]
+
+        new_model['optimizer'] = \
+            optimizer.apply_gradients(avg_gradients_and_vars, global_step=step)
+    else:
+        with tf.control_dependencies(update_ops):
+            new_model['optimizer'] = \
+                optimizer.minimize(model['loss'], global_step=step)
+
+    return new_model
+
+
+def build_model(data):
+    """
+    """
+    FLAGS = tf.app.flags.FLAGS
+
+    if FLAGS.model == 'mobilenets':
+        import qdraw.model_mobilenets as chosen_model
+    elif FLAGS.model == 'mobilenets_v2':
+        import qdraw.model_mobilenets_v2 as chosen_model
+    elif FLAGS.model == 'stochastic_depth':
+        import qdraw.model_stochastic_depth as chosen_model
+    elif FLAGS.model == 'blind':
+        import qdraw.model_blind as chosen_model
+    elif FLAGS.model == 'null':
+        import qdraw.model_null as chosen_model
+
+    if FLAGS.num_gpus > 1:
+        return build_model_replica(chosen_model, data)
+    else:
+        return build_model_single(chosen_model, data)
+
+
+def train(session, model, dataset_handle, reporter):
     """
     """
     FLAGS = tf.app.flags.FLAGS
@@ -121,32 +194,65 @@ def train(session, model, dataset_handle, summaries, reporter):
     # NOTE: decay policy?
     step = session.run(model['step'])
 
-    learning_rate = FLAGS.initial_learning_rate * (0.5 ** (step // 100000))
+    learning_rate = FLAGS.initial_learning_rate * (0.5 ** (step // 20000))
 
-    feeds = {
-        model['dataset_handle']: dataset_handle,
-        model['learning_rate']: learning_rate,
-        model['training']: True,
-    }
+    if FLAGS.num_gpus == 1 and FLAGS.batch_multiplier > 1:
+        feeds = {
+            model['dataset_handle']: dataset_handle,
+            model['learning_rate']: learning_rate,
+            model['training']: True,
+        }
 
-    fetch = {
-        'optimizer': model['optimizer'],
-        'loss': model['loss'],
-        'step': model['step'],
-        'summary': summaries['train_loss'],
-    }
+        fetch = [model['loss'], model['gradients_result']]
 
-    fetched = session.run(fetch, feed_dict=feeds)
+        all_gradients = []
 
-    reporter.add_summary(fetched['summary'], fetched['step'])
+        losses = 0.0
 
-    if fetched['step'] % 1000 == 0:
-        print('loss[{}]: {}'.format(fetched['step'], fetched['loss']))
+        for i in range(FLAGS.batch_multiplier):
+            loss, gradients = session.run(fetch, feed_dict=feeds)
 
-    return fetched['step']
+            losses += loss
+
+            all_gradients.append(gradients)
+
+        feeds = {
+            model['learning_rate']: learning_rate,
+        }
+
+        for i, gradients_source in enumerate(model['gradients_source']):
+            gradients = np.stack([g[i] for g in all_gradients], axis=0)
+
+            feeds[gradients_source] = np.mean(gradients, axis=0)
+
+        session.run(model['optimizer'], feed_dict=feeds)
+
+        loss = losses / FLAGS.batch_multiplier
+    else:
+        feeds = {
+            model['dataset_handle']: dataset_handle,
+            model['learning_rate']: learning_rate,
+            model['training']: True,
+        }
+
+        fetch = [model['loss'], model['optimizer']]
+
+        loss, _ = session.run(fetch, feed_dict=feeds)
+
+    step = session.run(model['step'])
+
+    summary = tf.Summary(
+        value=[tf.Summary.Value(tag='train_loss', simple_value=loss)])
+
+    reporter.add_summary(summary, step)
+
+    if step % 1000 == 0:
+        print('loss[{}]: {}'.format(step, loss))
+
+    return step
 
 
-def valid(session, model, data, dataset_handle, summaries, reporter):
+def valid(session, model, data, dataset_handle, reporter):
     """
     """
     step = session.run(model['step'])
@@ -269,7 +375,9 @@ def test(session, model, data, dataset_handle):
             writer.writerow(['key_id', 'word'])
 
             for idx, keyid in enumerate(all_keyids):
-                predictions = [dataset.index_to_label[all_predictions[idx, i]] for i in range(3)]
+                predictions = [
+                    dataset.index_to_label[
+                        all_predictions[idx, i]] for i in range(3)]
 
                 predictions = ' '.join(predictions)
 
@@ -291,8 +399,6 @@ def main(_):
         train_on_recognized=FLAGS.train_on_recognized)
 
     model = build_model(data)
-
-    summaries = build_summaries(model)
 
     reporter = tf.summary.FileWriter(FLAGS.logs_path)
 
@@ -317,9 +423,9 @@ def main(_):
         ts = time.clock()
 
         while True:
-            step = train(session, model, train_handle, summaries, reporter)
+            step = train(session, model, train_handle, reporter)
 
-            step = valid(session, model, data, valid_handle, summaries, reporter)
+            step = valid(session, model, data, valid_handle, reporter)
 
             if step % 1000 == 0:
                 t = time.clock()
@@ -353,10 +459,10 @@ if __name__ == '__main__':
     tf.app.flags.DEFINE_integer('num_gpus', 1, '')
     tf.app.flags.DEFINE_integer('image_size', 28, '')
     tf.app.flags.DEFINE_integer('batch_size', 100, '')
+    tf.app.flags.DEFINE_integer('batch_multiplier', 1, '')
 
     tf.app.flags.DEFINE_integer('stop_at_step', 1000, '')
 
     tf.app.flags.DEFINE_float('initial_learning_rate', 0.0001, '')
 
     tf.app.run()
-
