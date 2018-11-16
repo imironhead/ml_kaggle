@@ -12,98 +12,20 @@ import qdraw.dataset as dataset
 import qdraw.dataset_iterator as dataset_iterator
 
 
-def build_model_replica(chosen_model, data):
+def build_model(data):
     """
     """
     FLAGS = tf.app.flags.FLAGS
 
-    with tf.device('/cpu:0'):
-        # NOTE:
-        step = tf.train.get_or_create_global_step()
-
-        # NOTE:
-        training = tf.placeholder(shape=[], dtype=tf.bool)
-
-        # NOTE:
-        learning_rate = tf.placeholder(shape=[], dtype=tf.float32)
-
-        # NOTE:
-        optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
-
-    losses = []
-    tower_grads = []
-
-    for i in range(FLAGS.num_gpus):
-        keyids, images, strokes, lengths, recognized, labels = \
-            data['iterator'].get_next()
-
-        with tf.variable_scope('ngpus', reuse=tf.AUTO_REUSE):
-            with tf.name_scope('qdraw_{}'.format(i)) as scope:
-
-                device_setter = tf.train.replica_device_setter(
-                    worker_device='/gpu:{}'.format(i),
-                    ps_device='/cpu:0',
-                    ps_tasks=1)
-
-                with tf.device(device_setter):
-                    model = chosen_model.build_model(
-                        images, strokes, lengths, labels, training)
-
-                    losses.append(model['loss'])
-
-                    # NOTE: am I right?
-                    update_ops = \
-                        tf.get_collection(tf.GraphKeys.UPDATE_OPS, scope)
-
-                    with tf.control_dependencies(update_ops):
-                        grads = optimizer.compute_gradients(model['loss'])
-
-                    tower_grads.append(grads)
-
-                    # NOTE: all data go through a single gpu for inference
-                    if i == 0:
-                        keyids = keyids
-                        labels = model['labels']
-                        logits = model['logits']
-
-    with tf.device('/cpu:0'):
-        # NOTE: aggregate losses
-        loss = tf.stack(losses)
-        loss = tf.reduce_mean(loss, 0)
-
-        # NOTE: aggregate gradients
-        average_grads = []
-
-        for grad_and_vars in zip(*tower_grads):
-            grad = tf.stack([g for g, v in grad_and_vars])
-            grad = tf.reduce_mean(grad, 0)
-
-            average_grads.append((grad, grad_and_vars[0][1]))
-
-        # NOTE:
-        op_apply_gradient = \
-            optimizer.apply_gradients(average_grads, global_step=step)
-
-    return {
-        'keyids': keyids,
-        'labels': labels,
-        'recognized': recognized,
-
-        'step': step,
-        'training': training,
-        'learning_rate': learning_rate,
-        'dataset_handle': data['dataset_handle'],
-
-        'loss': loss,
-        'logits': logits,
-        'optimizer': op_apply_gradient,
-    }
-
-
-def build_model_single(chosen_model, data):
-    """
-    """
-    FLAGS = tf.app.flags.FLAGS
+    # NOTE: choose model
+    if FLAGS.model == 'mobilenets':
+        import qdraw.model_mobilenets as chosen_model
+    elif FLAGS.model == 'mobilenets_v2':
+        import qdraw.model_mobilenets_v2 as chosen_model
+    elif FLAGS.model == 'blind':
+        import qdraw.model_blind as chosen_model
+    elif FLAGS.model == 'null':
+        import qdraw.model_null as chosen_model
 
     # NOTE:
     step = tf.train.get_or_create_global_step()
@@ -128,8 +50,11 @@ def build_model_single(chosen_model, data):
 
     new_model = {
         'keyids': keyids,
-        'labels': labels,
+        'images': images,
+        'strokes': strokes,
+        'lengths': lengths,
         'recognized': recognized,
+        'labels': labels,
 
         'step': step,
         'training': training,
@@ -140,50 +65,34 @@ def build_model_single(chosen_model, data):
         'logits': model['logits'],
     }
 
-    if FLAGS.batch_multiplier > 1:
+    with tf.control_dependencies(update_ops):
+        gradients_and_vars = optimizer.compute_gradients(model['loss'])
+
+    # NOTE: if cyclic_batch_size_multiplier_tail is great than 1, we will do
+    #       gradients aggregation later
+    if FLAGS.cyclic_batch_size_multiplier_tail > 1:
         def placeholder(g):
             return tf.placeholder(shape=g.shape, dtype=g.dtype)
 
-        with tf.control_dependencies(update_ops):
-            gradients_and_vars = optimizer.compute_gradients(model['loss'])
-
-        avg_gradients_and_vars = \
-            [(placeholder(g), v) for g, v in gradients_and_vars]
-
-        new_model['gradients_source'] = [g for g, v in avg_gradients_and_vars]
-
+        # NOTE: an operator to collect computed gradients
         new_model['gradients_result'] = [g for g, v in gradients_and_vars]
 
-        new_model['optimizer'] = \
-            optimizer.apply_gradients(avg_gradients_and_vars, global_step=step)
-    else:
-        with tf.control_dependencies(update_ops):
-            new_model['optimizer'] = \
-                optimizer.minimize(model['loss'], global_step=step)
+        gradients_and_vars = \
+            [(placeholder(g), v) for g, v in gradients_and_vars]
+
+        # NOTE: an operator to feed manipulated gradients
+        new_model['gradients_source'] = [g for g, v in gradients_and_vars]
+
+    new_model['optimizer'] = \
+        optimizer.apply_gradients(gradients_and_vars, global_step=step)
+
+    # NOTE: Averaging Weights Leads to Wider Optima and Better
+    #       Generalization, 3.2 batch normalization
+    #       for updating training variables' running averaging
+    if FLAGS.swa_enable:
+        new_model['trainable_variables'] = tf.trainable_variables()
 
     return new_model
-
-
-def build_model(data):
-    """
-    """
-    FLAGS = tf.app.flags.FLAGS
-
-    if FLAGS.model == 'mobilenets':
-        import qdraw.model_mobilenets as chosen_model
-    elif FLAGS.model == 'mobilenets_v2':
-        import qdraw.model_mobilenets_v2 as chosen_model
-    elif FLAGS.model == 'stochastic_depth':
-        import qdraw.model_stochastic_depth as chosen_model
-    elif FLAGS.model == 'blind':
-        import qdraw.model_blind as chosen_model
-    elif FLAGS.model == 'null':
-        import qdraw.model_null as chosen_model
-
-    if FLAGS.num_gpus > 1:
-        return build_model_replica(chosen_model, data)
-    else:
-        return build_model_single(chosen_model, data)
 
 
 def train(session, model, dataset_handle, reporter):
@@ -191,12 +100,28 @@ def train(session, model, dataset_handle, reporter):
     """
     FLAGS = tf.app.flags.FLAGS
 
-    # NOTE: decay policy?
     step = session.run(model['step'])
 
-    learning_rate = FLAGS.initial_learning_rate * (0.5 ** (step // 20000))
+    # NOTE: learning rate interpolation for cyclic training
+    lr_head = FLAGS.cyclic_learning_rate_head
+    lr_tail = FLAGS.cyclic_learning_rate_tail
 
-    if FLAGS.num_gpus == 1 and FLAGS.batch_multiplier > 1:
+    alpha = (step % FLAGS.cyclic_num_steps) / (FLAGS.cyclic_num_steps - 1)
+
+    learning_rate = lr_head + (lr_tail - lr_head) * alpha
+
+    # NOTE: if cyclic_batch_size_multiplier_tail is great than 1, we want to do
+    #       gradients aggregation
+    if FLAGS.cyclic_batch_size_multiplier_tail > 1:
+        # NOTE: batch multiplier interpolation for cyclic training
+        scale_head = FLAGS.cyclic_batch_size_multiplier_head
+        scale_tail = FLAGS.cyclic_batch_size_multiplier_tail
+
+        # NOTE: assume FLAGS.cyclic_num_steps being far freater then scale
+        beta = FLAGS.cyclic_num_steps // (scale_tail - scale_head + 1)
+
+        batch_multiplier = scale_head + (step % FLAGS.cyclic_num_steps) // beta
+
         feeds = {
             model['dataset_handle']: dataset_handle,
             model['learning_rate']: learning_rate,
@@ -209,7 +134,7 @@ def train(session, model, dataset_handle, reporter):
 
         losses = 0.0
 
-        for i in range(FLAGS.batch_multiplier):
+        for i in range(batch_multiplier):
             loss, gradients = session.run(fetch, feed_dict=feeds)
 
             losses += loss
@@ -227,8 +152,10 @@ def train(session, model, dataset_handle, reporter):
 
         session.run(model['optimizer'], feed_dict=feeds)
 
-        loss = losses / FLAGS.batch_multiplier
+        loss = losses / batch_multiplier
     else:
+        # NOTE: FLAGS.cyclic_batch_size_multiplier_tail <= 1, do not need
+        #       gradients aggregation
         feeds = {
             model['dataset_handle']: dataset_handle,
             model['learning_rate']: learning_rate,
@@ -241,24 +168,31 @@ def train(session, model, dataset_handle, reporter):
 
     step = session.run(model['step'])
 
+    # NOTE: Averaging Weights Leads to Wider Optima and Better
+    #       Generalization
+    #       update running average of trainable variables
+    if step % FLAGS.cyclic_num_steps == 0:
+        pass
+
+    # NOTE: training log
     summary = tf.Summary(
         value=[tf.Summary.Value(tag='train_loss', simple_value=loss)])
 
     reporter.add_summary(summary, step)
 
     if step % 1000 == 0:
-        print('loss[{}]: {}'.format(step, loss))
-
-    return step
+        tf.logging.info('loss[{}]: {}'.format(step, loss))
 
 
 def valid(session, model, data, dataset_handle, reporter):
     """
     """
+    FLAGS = tf.app.flags.FLAGS
+
     step = session.run(model['step'])
 
-    if step % 10000 != 0:
-        return step
+    if step % FLAGS.cyclic_num_steps != 0:
+        return
 
     session.run(data['valid_iterator'].initializer)
 
@@ -318,15 +252,13 @@ def valid(session, model, data, dataset_handle, reporter):
 
     reporter.add_summary(summaries, step)
 
-    print('validation at step: {}'.format(step))
-    print('on recognized: {}'.format(num_recognized_correct / num_images))
-    print('map_1: {}'.format(aps[0] / num_images))
-    print('map_2: {}'.format(aps[1] / num_images))
-    print('map_3: {}'.format(aps[2] / num_images))
-    print('map@3: {}'.format(map_at_3))
-    print('.' * 64)
-
-    return step
+    tf.logging.info('validation at step: {}'.format(step))
+    tf.logging.info('on recognized: {}'.format(num_recognized_correct / num_images))
+    tf.logging.info('map_1: {}'.format(aps[0] / num_images))
+    tf.logging.info('map_2: {}'.format(aps[1] / num_images))
+    tf.logging.info('map_3: {}'.format(aps[2] / num_images))
+    tf.logging.info('map@3: {}'.format(map_at_3))
+    tf.logging.info('.' * 64)
 
 
 def test(session, model, data, dataset_handle):
@@ -383,7 +315,7 @@ def test(session, model, data, dataset_handle):
 
                 writer.writerow([keyid, predictions])
 
-        print('done: {}'.format(FLAGS.result_zip_path))
+        tf.logging.info('done: {}'.format(FLAGS.result_zip_path))
 
 
 def main(_):
@@ -392,7 +324,7 @@ def main(_):
     FLAGS = tf.app.flags.FLAGS
 
     data = dataset_iterator.build_dataset(
-        batch_size=FLAGS.batch_size,
+        batch_size=FLAGS.cyclic_batch_size,
         image_size=FLAGS.image_size,
         valid_dir_path=FLAGS.valid_dir_path,
         test_dir_path=FLAGS.test_dir_path,
@@ -420,49 +352,63 @@ def main(_):
         valid_handle = session.run(data['valid_iterator'].string_handle())
         test_handle = session.run(data['test_iterator'].string_handle())
 
-        ts = time.clock()
-
         while True:
-            step = train(session, model, train_handle, reporter)
+            train(session, model, train_handle, reporter)
 
-            step = valid(session, model, data, valid_handle, reporter)
+            valid(session, model, data, valid_handle, reporter)
 
-            if step % 1000 == 0:
-                t = time.clock()
+            step = session.run(model['step'])
 
-                print('[gpux{}] 1000 steps take {} seconds'.format(
-                    FLAGS.num_gpus, int(t - ts)))
-
-                ts = t
-
-            if step >= FLAGS.stop_at_step:
+            if step >= FLAGS.cyclic_num_steps * FLAGS.cyclic_num_cycles:
                 break
+
+        # NOTE: Averaging Weights Leads to Wider Optima and Better
+        #       Generalization, 3.2 batch normalization
+        #       if stochastic weight averaging (SWA) is enabled, feed some
+        #       training into the network without applying gradients
+        if FLAGS.swa_enable:
+            pass
 
         test(session, model, data, test_handle)
 
 
 if __name__ == '__main__':
-    tf.app.flags.DEFINE_string('train_dir_path', None, '')
-    tf.app.flags.DEFINE_string('valid_dir_path', None, '')
+    tf.app.flags.DEFINE_string('model', None, '')
+
     tf.app.flags.DEFINE_string('ckpt_path', None, '')
     tf.app.flags.DEFINE_string('logs_path', None, '')
-    tf.app.flags.DEFINE_string('model', None, '')
-    tf.app.flags.DEFINE_string('learning_rate_policy', None, '')
-    tf.app.flags.DEFINE_string('dataset_rotate_policy', None, '')
 
+    tf.app.flags.DEFINE_string('train_dir_path', None, '')
+    tf.app.flags.DEFINE_string('valid_dir_path', None, '')
     tf.app.flags.DEFINE_string('test_dir_path', None, '')
     tf.app.flags.DEFINE_string('result_zip_path', None, '')
 
-    tf.app.flags.DEFINE_boolean('save_checkpoint', False, '')
     tf.app.flags.DEFINE_boolean('train_on_recognized', False, '')
 
-    tf.app.flags.DEFINE_integer('num_gpus', 1, '')
     tf.app.flags.DEFINE_integer('image_size', 28, '')
-    tf.app.flags.DEFINE_integer('batch_size', 100, '')
-    tf.app.flags.DEFINE_integer('batch_multiplier', 1, '')
 
-    tf.app.flags.DEFINE_integer('stop_at_step', 1000, '')
+    # NOTE: each cycle consists of cyclic_num_steps steps
+    #       the model will be trained with cyclic_num_cycles cycles
+    tf.app.flags.DEFINE_integer('cyclic_num_steps', 1, '')
+    tf.app.flags.DEFINE_integer('cyclic_num_cycles', 1, '')
 
-    tf.app.flags.DEFINE_float('initial_learning_rate', 0.0001, '')
+    # NOTE: in each cycle, linearly increase size of mini batch
+    #       from cyclic_batch_size * cyclic_batch_size_multiplier_head
+    #       to   cyclic_batch_size * cyclic_batch_size_multiplier_tail
+    tf.app.flags.DEFINE_integer('cyclic_batch_size', 1, '')
+    tf.app.flags.DEFINE_integer('cyclic_batch_size_multiplier_head', 1, '')
+    tf.app.flags.DEFINE_integer('cyclic_batch_size_multiplier_tail', 1, '')
+
+    # NOTE: in each cycle, linearly decrease learning rate
+    #       from cyclic_learning_rate_head
+    #       to   cyclic_learning_rate_tail
+    tf.app.flags.DEFINE_float('cyclic_learning_rate_head', 0.0001, '')
+    tf.app.flags.DEFINE_float('cyclic_learning_rate_tail', 0.0001, '')
+
+    # NOTE: stochastic weight averaging (SWA)
+    tf.app.flags.DEFINE_boolean('swa_enable', False, '')
+
+    # NOTE:
+    tf.logging.set_verbosity(tf.logging.INFO)
 
     tf.app.run()
