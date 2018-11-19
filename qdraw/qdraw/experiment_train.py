@@ -191,16 +191,15 @@ def valid(session, model, data, dataset_handle, reporter):
 
     step = session.run(model['step'])
 
-    if step % FLAGS.cyclic_num_steps != 0:
+    if step % FLAGS.valid_cycle != 0:
         return
 
     session.run(data['valid_iterator'].initializer)
 
     losses = 0.0
-    num_images = 0
-    aps = [0.0, 0.0, 0.0]
-
-    num_recognized_correct = 0
+    logits = []
+    labels = []
+    recognized = []
 
     while True:
         try:
@@ -218,47 +217,91 @@ def valid(session, model, data, dataset_handle, reporter):
 
             fetched = session.run(fetch, feed_dict=feeds)
 
-            losses = losses + fetched['loss']
+            losses = losses + fetched['loss'] * fetched['labels'].shape[0]
 
-            labels = fetched['labels']
+            logits.append(fetched['logits'])
 
-            logits = np.argsort(fetched['logits'], axis=1)
+            labels.append(fetched['labels'])
 
-            logits = logits[:, -1:-4:-1]
-
-            num_images += logits.shape[0]
-
-            for i in range(3):
-                aps[i] += np.sum(logits[:, i] == labels) / float(i + 1)
-
-            correct = (logits[:, 0] == labels)
-            recognized = (fetched['recognized'] == 1)
-
-            num_recognized_correct += np.sum(correct == recognized)
+            recognized.append(fetched['recognized'])
         except tf.errors.OutOfRangeError:
             break
 
-    map_at_3 = sum(aps) / float(num_images)
+    # NOTE: a method to evaluate on a dataset
+    def evaluate(softmax, labels, recognized, name, reporter, step):
+        """
+        """
+        num_images = softmax.shape[0]
 
-    # NOTE: validation loss & map summary
-    losses = losses / float(num_images)
+        predictions = np.argsort(softmax, axis=1)
+        predictions = predictions[:, -1:-4:-1]
 
-    summaries = [
-        tf.Summary.Value(tag='valid_loss', simple_value=losses),
-        tf.Summary.Value(tag='map', simple_value=map_at_3),
-    ]
+        correct = (predictions[:, 0] == labels)
+        recognized = (recognized == 1)
 
-    summaries = tf.Summary(value=summaries)
+        accuracy_on_recognized = \
+            np.sum(correct == recognized) / np.sum(recognized)
 
-    reporter.add_summary(summaries, step)
+        map_1 = np.sum(predictions[:, 0] == labels) / (1.0 * num_images)
+        map_2 = np.sum(predictions[:, 1] == labels) / (2.0 * num_images)
+        map_3 = np.sum(predictions[:, 2] == labels) / (3.0 * num_images)
 
-    tf.logging.info('validation at step: {}'.format(step))
-    tf.logging.info('on recognized: {}'.format(num_recognized_correct / num_images))
-    tf.logging.info('map_1: {}'.format(aps[0] / num_images))
-    tf.logging.info('map_2: {}'.format(aps[1] / num_images))
-    tf.logging.info('map_3: {}'.format(aps[2] / num_images))
-    tf.logging.info('map@3: {}'.format(map_at_3))
-    tf.logging.info('.' * 64)
+        map_all = map_1 + map_2 + map_3
+
+        summaries = [
+            tf.Summary.Value(tag='{}_map3'.format(name), simple_value=map_all),
+        ]
+
+        summaries = tf.Summary(value=summaries)
+
+        reporter.add_summary(summaries, step)
+
+        tf.logging.info('{} step {}'.format(name, step))
+        tf.logging.info(
+            'accuracy on recognized: {}'.format(accuracy_on_recognized))
+        tf.logging.info('map_1: {}'.format(map_1))
+        tf.logging.info('map_2: {}'.format(map_2))
+        tf.logging.info('map_3: {}'.format(map_3))
+        tf.logging.info('map@3: {}'.format(map_all))
+        tf.logging.info('-' * 64)
+
+    # NOTE: concat matrix
+    logits = np.concatenate(logits, axis=0)
+    labels = np.concatenate(labels, axis=0)
+    recognized = np.concatenate(recognized, axis=0)
+
+    # NOTE: do softmax on logits
+    temp = np.exp(logits)
+
+    softmax = temp / np.sum(temp, axis=1, keepdims=True)
+
+    # NOTE: loss validation loss
+    loss = losses / logits.shape[0]
+
+    summary = tf.Summary(
+        value=[tf.Summary.Value(tag='valid_loss', simple_value=loss)])
+
+    reporter.add_summary(summary, step)
+
+    # NOTE: evaluate on whole validation set
+    evaluate(softmax, labels, recognized, 'valid_all', reporter, step)
+
+    # NOTE: evaluate on tta
+    if FLAGS.tta_enable:
+        num_groups = softmax.shape[0] // FLAGS.tta_num_samples_valid
+
+        num_classes = softmax.shape[-1]
+
+        softmax = np.reshape(
+            softmax, [num_groups, FLAGS.tta_num_samples_valid, num_classes])
+
+        softmax = np.sum(softmax, axis=0)
+
+        labels = labels[:FLAGS.tta_num_samples_valid]
+
+        recognized = recognized[:FLAGS.tta_num_samples_valid]
+
+        evaluate(softmax, labels, recognized, 'valid_tta', reporter, step)
 
 
 def test(session, model, data, dataset_handle):
@@ -266,8 +309,11 @@ def test(session, model, data, dataset_handle):
     """
     FLAGS = tf.app.flags.FLAGS
 
-    all_keyids = []
-    all_predictions = []
+    if FLAGS.result_zip_path is None:
+        return
+
+    keyids = []
+    logits = []
 
     session.run(data['test_iterator'].initializer)
 
@@ -285,37 +331,54 @@ def test(session, model, data, dataset_handle):
 
             fetched = session.run(fetch, feed_dict=feeds)
 
-            keyids = fetched['keyids']
-
-            predictions = np.argsort(fetched['logits'], axis=1)
-
-            predictions = predictions[:, -1:-4:-1]
-
-            all_keyids.append(keyids)
-            all_predictions.append(predictions)
+            keyids.append(fetched['keyids'])
+            logits.append(fetched['logits'])
         except tf.errors.OutOfRangeError:
             break
 
-    all_keyids = np.concatenate(all_keyids, axis=0)
-    all_predictions = np.concatenate(all_predictions, axis=0)
+    # NOTE: concat matrix
+    keyids = np.concatenate(keyids, axis=0)
+    logits = np.concatenate(logits, axis=0)
 
-    if FLAGS.result_zip_path is not None:
-        with gzip.open(
-                FLAGS.result_zip_path, mode='wt', encoding='utf-8') as zf:
-            writer = csv.writer(zf, lineterminator='\n')
+    # NOTE: do softmax on logits
+    temp = np.exp(logits)
 
-            writer.writerow(['key_id', 'word'])
+    softmax = temp / np.sum(temp, axis=1, keepdims=True)
 
-            for idx, keyid in enumerate(all_keyids):
-                predictions = [
-                    dataset.index_to_label[
-                        all_predictions[idx, i]] for i in range(3)]
+    # NOTE: evaluate on tta
+    if FLAGS.tta_enable:
+        num_groups = softmax.shape[0] // FLAGS.tta_num_samples_test
 
-                predictions = ' '.join(predictions)
+        num_classes = softmax.shape[-1]
 
-                writer.writerow([keyid, predictions])
+        softmax = np.reshape(
+            softmax, [num_groups, FLAGS.tta_num_samples_test, num_classes])
 
-        tf.logging.info('done: {}'.format(FLAGS.result_zip_path))
+        softmax = np.sum(softmax, axis=0)
+    else:
+        # NOTE: remove augmented part if tta is not enabled
+        softmax = softmax[:FLAGS.tta_num_samples_test]
+
+    keyids = keyids[:FLAGS.tta_num_samples_test]
+
+    predictions = np.argsort(softmax, axis=1)
+    predictions = predictions[:, -1:-4:-1]
+
+    with gzip.open(FLAGS.result_zip_path, mode='wt', encoding='utf-8') as zf:
+        writer = csv.writer(zf, lineterminator='\n')
+
+        writer.writerow(['key_id', 'word'])
+
+        for idx, keyid in enumerate(keyids):
+            guess = [
+                dataset.index_to_label[
+                    predictions[idx, i]] for i in range(3)]
+
+            guess = ' '.join(guess)
+
+            writer.writerow([keyid, guess])
+
+    tf.logging.info('done: {}'.format(FLAGS.result_zip_path))
 
 
 def main(_):
@@ -387,6 +450,9 @@ if __name__ == '__main__':
 
     tf.app.flags.DEFINE_integer('image_size', 28, '')
 
+    # NOTE: do validation every FLAGS.valid_cycle steps
+    tf.app.flags.DEFINE_integer('valid_cycle', 10000, '')
+
     # NOTE: each cycle consists of cyclic_num_steps steps
     #       the model will be trained with cyclic_num_cycles cycles
     tf.app.flags.DEFINE_integer('cyclic_num_steps', 1, '')
@@ -404,6 +470,19 @@ if __name__ == '__main__':
     #       to   cyclic_learning_rate_tail
     tf.app.flags.DEFINE_float('cyclic_learning_rate_head', 0.0001, '')
     tf.app.flags.DEFINE_float('cyclic_learning_rate_tail', 0.0001, '')
+
+    # NOTE: test time augmentation
+    tf.app.flags.DEFINE_boolean('tta_enable', False, '')
+
+    # NOTE: if FLAGS.tta_enable is true, apply tta to validation and test set.
+    #
+    #       number of validation samples would be FLAGS.tta_num_samples_valid
+    #       and not be shuffled.
+    #
+    #       number of testing samples would be FLAGS.tta_num_samples_test and
+    #       not be shuffled
+    tf.app.flags.DEFINE_integer('tta_num_samples_valid', 0, '')
+    tf.app.flags.DEFINE_integer('tta_num_samples_test', 0, '')
 
     # NOTE: stochastic weight averaging (SWA)
     tf.app.flags.DEFINE_boolean('swa_enable', False, '')

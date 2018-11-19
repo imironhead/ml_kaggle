@@ -56,7 +56,9 @@ def build_iterator(
     fn_decode = functools.partial(decode, image_size=image_size)
 
     fn_reader = functools.partial(
-        tf.data.TFRecordDataset, compression_type='GZIP', num_parallel_reads=4)
+        tf.data.TFRecordDataset,
+        compression_type='GZIP',
+        num_parallel_reads=32 if is_training else 1)
 
     data = tf.data.Dataset.from_tensor_slices(record_paths)
 
