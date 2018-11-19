@@ -8,6 +8,7 @@ import multiprocessing.dummy
 import os
 import random
 
+import cv2
 import numpy as np
 import skimage.draw
 import skimage.io
@@ -99,20 +100,7 @@ def strokes_to_series(strokes):
     return points.flatten().tostring()
 
 
-def strokes_to_image(strokes, image_size):
-    """
-    import cv2
-
-    image = np.zeros((256, 256), dtype=np.uint8)
-
-    for t, (xs, ys) in enumerate(strokes):
-        color = 255 - min(t, 10) * 13
-
-        for i in range(1, len(xs)):
-            cv2.line(image, (xs[i-1], ys[i-1]), (xs[i], ys[i]), color, 6)
-
-    if image_size != 256:
-        image = cv2.resize(image, (image_size, image_size))
+def strokes_to_image(strokes, image_size, thickness):
     """
     scale = 256 // image_size
 
@@ -129,6 +117,18 @@ def strokes_to_image(strokes, image_size):
                 xs[i] // scale)
 
             image[rr, cc] = val * color
+    """
+    image = np.zeros((256, 256), dtype=np.uint8)
+
+    for t, (xs, ys) in enumerate(strokes):
+        color = 255 - min(t, 10) * 13
+
+        for i in range(1, len(xs)):
+            cv2.line(
+                image, (xs[i-1], ys[i-1]), (xs[i], ys[i]), color, thickness)
+
+    if image_size != 256:
+        image = cv2.resize(image, (image_size, image_size))
 
     return image.flatten().tostring()
 
@@ -167,13 +167,16 @@ def row_to_example_training(row, image_size, perturb):
     # NOTE:
     if perturb:
         strokes = perturb_strokes(strokes)
+        thickness = np.random.randint(4, 8)
+    else:
+        thickness = 4
 
     # NOTE: process strokes
     strokes = center_strokes(strokes)
 
     series = strokes_to_series(strokes)
 
-    image = strokes_to_image(strokes, image_size)
+    image = strokes_to_image(strokes, image_size, thickness)
 
     # NOTE: make example
     feature = {
@@ -205,7 +208,7 @@ def row_to_example_testing(row, image_size, perturb):
 
     series = strokes_to_series(strokes)
 
-    image = strokes_to_image(strokes, image_size)
+    image = strokes_to_image(strokes, image_size, 4)
 
     # NOTE: make example
     feature = {
