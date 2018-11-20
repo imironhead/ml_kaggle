@@ -68,12 +68,13 @@ def build_model(data):
     with tf.control_dependencies(update_ops):
         gradients_and_vars = optimizer.compute_gradients(model['loss'])
 
+    # NOTE: helper function to create a placeholder for a variable
+    def placeholder(g):
+        return tf.placeholder(shape=g.shape, dtype=g.dtype)
+
     # NOTE: if cyclic_batch_size_multiplier_tail is great than 1, we will do
     #       gradients aggregation later
     if FLAGS.cyclic_batch_size_multiplier_tail > 1:
-        def placeholder(g):
-            return tf.placeholder(shape=g.shape, dtype=g.dtype)
-
         # NOTE: an operator to collect computed gradients
         new_model['gradients_result'] = [g for g, v in gradients_and_vars]
 
@@ -90,7 +91,17 @@ def build_model(data):
     #       Generalization, 3.2 batch normalization
     #       for updating training variables' running averaging
     if FLAGS.swa_enable:
-        new_model['trainable_variables'] = tf.trainable_variables()
+        new_model['swa'] = []
+
+        for variable in tf.trainable_variables():
+            ph = placeholder(variable)
+
+            new_model['swa'].append({
+                'variable': variable,
+                'placeholder': ph,
+                'var_op': tf.assign(variable, ph),
+                'amount': 0.0,
+                'weights': 0.0})
 
     return new_model
 
@@ -154,7 +165,7 @@ def train(session, model, dataset_handle, reporter):
 
         loss = losses / batch_multiplier
     else:
-        # NOTE: FLAGS.cyclic_batch_size_multiplier_tail <= 1, do not need
+        # NOTE: FLAGS.cyclic_batch_size_multiplier_tail <= 1, need no
         #       gradients aggregation
         feeds = {
             model['dataset_handle']: dataset_handle,
@@ -172,7 +183,16 @@ def train(session, model, dataset_handle, reporter):
     #       Generalization
     #       update running average of trainable variables
     if step % FLAGS.cyclic_num_steps == 0:
-        pass
+        for v in model['swa']:
+            weights = session.run(v['variable'])
+
+            v['weights'] = \
+                (v['weights'] * v['amount'] + weights) / (v['amount'] + 1.0)
+
+            v['amount'] += 1.0
+
+            session.run(
+                v['var_op'], feed_dict={v['placeholder']: v['weights']})
 
     # NOTE: training log
     summary = tf.Summary(
