@@ -37,7 +37,13 @@ def build_model(data):
     learning_rate = tf.placeholder(shape=[], dtype=tf.float32)
 
     # NOTE:
-    optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
+    if FLAGS.optimizer == 'adam':
+        optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
+    elif FLAGS.optimizer == 'nesterov':
+        optimizer = tf.train.MomentumOptimizer(
+            learning_rate=learning_rate,
+            momentum=0.9,
+            use_nesterov=True)
 
     #
     keyids, images, strokes, lengths, recognized, labels = \
@@ -63,6 +69,8 @@ def build_model(data):
 
         'loss': model['loss'],
         'logits': model['logits'],
+
+        'swa': [],
     }
 
     with tf.control_dependencies(update_ops):
@@ -91,8 +99,6 @@ def build_model(data):
     #       Generalization, 3.2 batch normalization
     #       for updating training variables' running averaging
     if FLAGS.swa_enable:
-        new_model['swa'] = []
-
         for variable in tf.trainable_variables():
             ph = placeholder(variable)
 
@@ -101,7 +107,8 @@ def build_model(data):
                 'placeholder': ph,
                 'var_op': tf.assign(variable, ph),
                 'amount': 0.0,
-                'weights': 0.0})
+                'swa_weights': 0.0,
+                'tmp_weights': 0.0})
 
     return new_model
 
@@ -129,7 +136,7 @@ def train(session, model, dataset_handle, reporter):
         scale_tail = FLAGS.cyclic_batch_size_multiplier_tail
 
         # NOTE: assume FLAGS.cyclic_num_steps being far freater then scale
-        beta = FLAGS.cyclic_num_steps // (scale_tail - scale_head + 1)
+        beta = (FLAGS.cyclic_num_steps - 1) // (scale_tail - scale_head + 1)
 
         batch_multiplier = scale_head + (step % FLAGS.cyclic_num_steps) // beta
 
@@ -186,13 +193,10 @@ def train(session, model, dataset_handle, reporter):
         for v in model['swa']:
             weights = session.run(v['variable'])
 
-            v['weights'] = \
-                (v['weights'] * v['amount'] + weights) / (v['amount'] + 1.0)
+            v['swa_weights'] = \
+                (v['swa_weights'] * v['amount'] + weights) / (v['amount'] + 1.0)
 
             v['amount'] += 1.0
-
-            session.run(
-                v['var_op'], feed_dict={v['placeholder']: v['weights']})
 
     # NOTE: training log
     summary = tf.Summary(
@@ -213,6 +217,16 @@ def valid(session, model, data, dataset_handle, reporter):
 
     if step % FLAGS.valid_cycle != 0:
         return
+
+    # NOTE: Averaging Weights Leads to Wider Optima and Better
+    #       Generalization
+    #       catch trained variables and replace them with swa
+    #       update running average of trainable variables for validation
+    for v in model['swa']:
+        v['tmp_weights'] = session.run(v['variable'])
+
+        session.run(
+            v['var_op'], feed_dict={v['placeholder']: v['swa_weights']})
 
     session.run(data['valid_iterator'].initializer)
 
@@ -322,6 +336,14 @@ def valid(session, model, data, dataset_handle, reporter):
         recognized = recognized[:FLAGS.tta_num_samples_valid]
 
         evaluate(softmax, labels, recognized, 'valid_tta', reporter, step)
+
+    # NOTE: Averaging Weights Leads to Wider Optima and Better
+    #       Generalization
+    #
+    #       roll back training weights
+    for v in model['swa']:
+        session.run(
+            v['var_op'], feed_dict={v['placeholder']: v['tmp_weights']})
 
 
 def test(session, model, data, dataset_handle):
@@ -446,12 +468,26 @@ def main(_):
                 break
 
         # NOTE: Averaging Weights Leads to Wider Optima and Better
-        #       Generalization, 3.2 batch normalization
-        #       if stochastic weight averaging (SWA) is enabled, feed some
-        #       training into the network without applying gradients
-        if FLAGS.swa_enable:
-            pass
+        #       Generalization
+        #
+        #       replace weights with swa weights
+        for v in model['swa']:
+            session.run(
+                v['var_op'], feed_dict={v['placeholder']: v['swa_weights']})
 
+        # NOTE: Averaging Weights Leads to Wider Optima and Better
+        #       Generalization
+        #
+        #       update batch normalization
+        feeds = {
+            model['dataset_handle']: train_handle,
+            model['training']: True,
+        }
+
+        for _ in range(100):
+            session.run(model['gradients_result'], feed_dict=feeds)
+
+        # NOTE: final test
         test(session, model, data, test_handle)
 
 
@@ -472,6 +508,9 @@ if __name__ == '__main__':
 
     # NOTE: do validation every FLAGS.valid_cycle steps
     tf.app.flags.DEFINE_integer('valid_cycle', 10000, '')
+
+    # NOTE: optimizer
+    tf.app.flags.DEFINE_string('optimizer', 'adam', '')
 
     # NOTE: each cycle consists of cyclic_num_steps steps
     #       the model will be trained with cyclic_num_cycles cycles
