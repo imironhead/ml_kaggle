@@ -73,12 +73,12 @@ def build_model(data):
         'swa': [],
     }
 
-    with tf.control_dependencies(update_ops):
-        gradients_and_vars = optimizer.compute_gradients(model['loss'])
-
     # NOTE: helper function to create a placeholder for a variable
     def placeholder(g):
         return tf.placeholder(shape=g.shape, dtype=g.dtype)
+
+    with tf.control_dependencies(update_ops):
+        gradients_and_vars = optimizer.compute_gradients(model['loss'])
 
     # NOTE: if cyclic_batch_size_multiplier_tail is great than 1, we will do
     #       gradients aggregation later
@@ -113,10 +113,12 @@ def build_model(data):
     return new_model
 
 
-def train(session, model, dataset_handle, reporter):
+def train(session, experiment):
     """
     """
     FLAGS = tf.app.flags.FLAGS
+
+    model = experiment['model']
 
     step = session.run(model['step'])
 
@@ -128,6 +130,13 @@ def train(session, model, dataset_handle, reporter):
 
     learning_rate = lr_head + (lr_tail - lr_head) * alpha
 
+    # NOTE: feeds for training
+    feeds = {
+        model['dataset_handle']: experiment['data']['train_handle'],
+        model['learning_rate']: learning_rate,
+        model['training']: True,
+    }
+
     # NOTE: if cyclic_batch_size_multiplier_tail is great than 1, we want to do
     #       gradients aggregation
     if FLAGS.cyclic_batch_size_multiplier_tail > 1:
@@ -136,29 +145,24 @@ def train(session, model, dataset_handle, reporter):
         scale_tail = FLAGS.cyclic_batch_size_multiplier_tail
 
         # NOTE: assume FLAGS.cyclic_num_steps being far freater then scale
-        beta = (FLAGS.cyclic_num_steps - 1) // (scale_tail - scale_head + 1)
+        beta = FLAGS.cyclic_num_steps // (scale_tail - scale_head + 1)
 
         batch_multiplier = scale_head + (step % FLAGS.cyclic_num_steps) // beta
-
-        feeds = {
-            model['dataset_handle']: dataset_handle,
-            model['learning_rate']: learning_rate,
-            model['training']: True,
-        }
-
-        fetch = [model['loss'], model['gradients_result']]
 
         all_gradients = []
 
         losses = 0.0
 
+        # NOTE: compute gradients on nano batches
         for i in range(batch_multiplier):
-            loss, gradients = session.run(fetch, feed_dict=feeds)
+            loss, gradients = session.run(
+                [model['loss'], model['gradients_result']], feed_dict=feeds)
 
             losses += loss
 
             all_gradients.append(gradients)
 
+        # NOTE: aggregate & apply gradients
         feeds = {
             model['learning_rate']: learning_rate,
         }
@@ -174,20 +178,14 @@ def train(session, model, dataset_handle, reporter):
     else:
         # NOTE: FLAGS.cyclic_batch_size_multiplier_tail <= 1, need no
         #       gradients aggregation
-        feeds = {
-            model['dataset_handle']: dataset_handle,
-            model['learning_rate']: learning_rate,
-            model['training']: True,
-        }
-
         fetch = [model['loss'], model['optimizer']]
 
         loss, _ = session.run(fetch, feed_dict=feeds)
 
     step = session.run(model['step'])
 
-    # NOTE: Averaging Weights Leads to Wider Optima and Better
-    #       Generalization
+    # NOTE: Averaging Weights Leads to Wider Optima and Better Generalization
+    #
     #       update running average of trainable variables
     if step % FLAGS.cyclic_num_steps == 0:
         for v in model['swa']:
@@ -202,65 +200,15 @@ def train(session, model, dataset_handle, reporter):
     summary = tf.Summary(
         value=[tf.Summary.Value(tag='train_loss', simple_value=loss)])
 
-    reporter.add_summary(summary, step)
+    experiment['reporter'].add_summary(summary, step)
 
     if step % 1000 == 0:
         tf.logging.info('loss[{}]: {}'.format(step, loss))
 
 
-def valid(session, model, data, dataset_handle, reporter):
+def valid(session, experiment):
     """
     """
-    FLAGS = tf.app.flags.FLAGS
-
-    step = session.run(model['step'])
-
-    if step % FLAGS.valid_cycle != 0:
-        return
-
-    # NOTE: Averaging Weights Leads to Wider Optima and Better
-    #       Generalization
-    #       catch trained variables and replace them with swa
-    #       update running average of trainable variables for validation
-    for v in model['swa']:
-        v['tmp_weights'] = session.run(v['variable'])
-
-        session.run(
-            v['var_op'], feed_dict={v['placeholder']: v['swa_weights']})
-
-    session.run(data['valid_iterator'].initializer)
-
-    losses = 0.0
-    logits = []
-    labels = []
-    recognized = []
-
-    while True:
-        try:
-            feeds = {
-                model['dataset_handle']: dataset_handle,
-                model['training']: False,
-            }
-
-            fetch = {
-                'loss': model['loss'],
-                'labels': model['labels'],
-                'logits': model['logits'],
-                'recognized': model['recognized'],
-            }
-
-            fetched = session.run(fetch, feed_dict=feeds)
-
-            losses = losses + fetched['loss'] * fetched['labels'].shape[0]
-
-            logits.append(fetched['logits'])
-
-            labels.append(fetched['labels'])
-
-            recognized.append(fetched['recognized'])
-        except tf.errors.OutOfRangeError:
-            break
-
     # NOTE: a method to evaluate on a dataset
     def evaluate(softmax, labels, recognized, name, reporter, step):
         """
@@ -298,6 +246,74 @@ def valid(session, model, data, dataset_handle, reporter):
         tf.logging.info('map_3: {}'.format(map_3))
         tf.logging.info('map@3: {}'.format(map_all))
         tf.logging.info('-' * 64)
+
+    FLAGS = tf.app.flags.FLAGS
+
+    model = experiment['model']
+
+    reporter = experiment['reporter']
+
+    step = session.run(model['step'])
+
+    if step % FLAGS.valid_cycle != 0:
+        return
+
+    # NOTE: Averaging Weights Leads to Wider Optima and Better Generalization
+    #
+    #       catch trained variables and replace them with swa
+    #       update running average of trainable variables for validation
+    for v in model['swa']:
+        v['tmp_weights'] = session.run(v['variable'])
+
+        session.run(
+            v['var_op'], feed_dict={v['placeholder']: v['swa_weights']})
+
+    # NOTE: Averaging Weights Leads to Wider Optima and Better Generalization
+    #
+    #       update batch normalization
+    feeds = {
+        model['dataset_handle']: experiment['data']['train_handle'],
+        model['training']: True,
+    }
+
+    for _ in range(100):
+        session.run(model['gradients_result'], feed_dict=feeds)
+
+
+    # NOTE: reset validation dataset
+    session.run(experiment['data']['valid_iterator'].initializer)
+
+    # NOTE: iterator of validation dataset only iterate the dataset once.
+    losses = 0.0
+    logits = []
+    labels = []
+    recognized = []
+
+    feeds = {
+        model['dataset_handle']: experiment['data']['valid_handle'],
+        model['training']: False,
+    }
+
+    fetch = {
+        'loss': model['loss'],
+        'labels': model['labels'],
+        'logits': model['logits'],
+        'recognized': model['recognized'],
+    }
+
+    while True:
+        try:
+            fetched = session.run(fetch, feed_dict=feeds)
+
+            losses = losses + fetched['loss'] * fetched['labels'].shape[0]
+
+            logits.append(fetched['logits'])
+
+            labels.append(fetched['labels'])
+
+            recognized.append(fetched['recognized'])
+        except tf.errors.OutOfRangeError:
+            break
 
     # NOTE: concat matrix
     logits = np.concatenate(logits, axis=0)
@@ -346,7 +362,7 @@ def valid(session, model, data, dataset_handle, reporter):
             v['var_op'], feed_dict={v['placeholder']: v['tmp_weights']})
 
 
-def test(session, model, data, dataset_handle):
+def test(session, experiment):
     """
     """
     FLAGS = tf.app.flags.FLAGS
@@ -354,23 +370,46 @@ def test(session, model, data, dataset_handle):
     if FLAGS.result_zip_path is None:
         return
 
+    model = experiment['model']
+
+    # NOTE: Averaging Weights Leads to Wider Optima and Better Generalization
+    #
+    #       replace weights with swa weights
+    for v in model['swa']:
+        session.run(
+            v['var_op'], feed_dict={v['placeholder']: v['swa_weights']})
+
+    # NOTE: Averaging Weights Leads to Wider Optima and Better Generalization
+    #
+    #       update batch normalization
+    if model['swa']:
+        feeds = {
+            model['dataset_handle']: experiment['data']['train_handle'],
+            model['training']: True,
+        }
+
+        for _ in range(100):
+            session.run(model['gradients_result'], feed_dict=feeds)
+
+    # NOTE: collect predictions
     keyids = []
     logits = []
 
-    session.run(data['test_iterator'].initializer)
+    # NOTE: reset iterator of testing dataset
+    session.run(experiment['data']['test_iterator'].initializer)
+
+    feeds = {
+        model['dataset_handle']: experiment['data']['test_handle'],
+        model['training']: False,
+    }
+
+    fetch = {
+        'keyids': model['keyids'],
+        'logits': model['logits'],
+    }
 
     while True:
         try:
-            feeds = {
-                model['dataset_handle']: dataset_handle,
-                model['training']: False,
-            }
-
-            fetch = {
-                'keyids': model['keyids'],
-                'logits': model['logits'],
-            }
-
             fetched = session.run(fetch, feed_dict=feeds)
 
             keyids.append(fetched['keyids'])
@@ -428,67 +467,57 @@ def main(_):
     """
     FLAGS = tf.app.flags.FLAGS
 
-    data = dataset_iterator.build_dataset(
+    # NOTE: to keep information
+    experiment = {}
+
+    # NOTE: collect path of training data
+    train_record_paths = tf.gfile.ListDirectory(FLAGS.train_dir_path)
+    train_record_paths = \
+        [os.path.join(FLAGS.train_dir_path, n) for n in train_record_paths]
+
+    # NOTE: build dataset iterators
+    experiment['data'] = dataset_iterator.build_dataset(
         batch_size=FLAGS.cyclic_batch_size,
         image_size=FLAGS.image_size,
         valid_dir_path=FLAGS.valid_dir_path,
         test_dir_path=FLAGS.test_dir_path,
         train_on_recognized=FLAGS.train_on_recognized)
 
-    model = build_model(data)
+    # NOTE: build model
+    experiment['model'] = build_model(experiment['data'])
 
-    reporter = tf.summary.FileWriter(FLAGS.logs_path)
+    # NOTE: build file writer to keep log
+    experiment['reporter'] = tf.summary.FileWriter(FLAGS.logs_path)
 
     with tf.Session() as session:
         session.run(tf.global_variables_initializer())
 
-        # NOTE: initialize dataset iterator
-        train_record_paths = tf.gfile.ListDirectory(FLAGS.train_dir_path)
-        train_record_paths = \
-            [os.path.join(FLAGS.train_dir_path, n) for n in train_record_paths]
-
+        # NOTE: initialize training data iterator
         session.run(
-            data['train_iterator'].initializer,
-            feed_dict={data['train_record_paths']: train_record_paths})
-        session.run(data['valid_iterator'].initializer)
+            experiment['data']['train_iterator'].initializer,
+            feed_dict={
+                experiment['data']['train_record_paths']: train_record_paths})
 
         # NOTE: generate handles for switching dataset
-        train_handle = session.run(data['train_iterator'].string_handle())
-        valid_handle = session.run(data['valid_iterator'].string_handle())
-        test_handle = session.run(data['test_iterator'].string_handle())
+        experiment['data']['train_handle'] = \
+            session.run(experiment['data']['train_iterator'].string_handle())
+        experiment['data']['valid_handle'] = \
+            session.run(experiment['data']['valid_iterator'].string_handle())
+        experiment['data']['test_handle'] = \
+            session.run(experiment['data']['test_iterator'].string_handle())
 
         while True:
-            train(session, model, train_handle, reporter)
+            train(session, experiment)
 
-            valid(session, model, data, valid_handle, reporter)
+            valid(session, experiment)
 
-            step = session.run(model['step'])
+            step = session.run(experiment['model']['step'])
 
             if step >= FLAGS.cyclic_num_steps * FLAGS.cyclic_num_cycles:
                 break
 
-        # NOTE: Averaging Weights Leads to Wider Optima and Better
-        #       Generalization
-        #
-        #       replace weights with swa weights
-        for v in model['swa']:
-            session.run(
-                v['var_op'], feed_dict={v['placeholder']: v['swa_weights']})
-
-        # NOTE: Averaging Weights Leads to Wider Optima and Better
-        #       Generalization
-        #
-        #       update batch normalization
-        feeds = {
-            model['dataset_handle']: train_handle,
-            model['training']: True,
-        }
-
-        for _ in range(100):
-            session.run(model['gradients_result'], feed_dict=feeds)
-
         # NOTE: final test
-        test(session, model, data, test_handle)
+        test(session, experiment)
 
 
 if __name__ == '__main__':
