@@ -22,6 +22,8 @@ def build_model(data):
         import qdraw.model_mobilenets as chosen_model
     elif FLAGS.model == 'mobilenets_v2':
         import qdraw.model_mobilenets_v2 as chosen_model
+    elif FLAGS.model == 'resnet':
+        import qdraw.model_resnet as chosen_model
     elif FLAGS.model == 'blind':
         import qdraw.model_blind as chosen_model
     elif FLAGS.model == 'null':
@@ -80,17 +82,15 @@ def build_model(data):
     with tf.control_dependencies(update_ops):
         gradients_and_vars = optimizer.compute_gradients(model['loss'])
 
-    # NOTE: if cyclic_batch_size_multiplier_tail is great than 1, we will do
+    # NOTE: if cyclic_batch_size_multiplier_max is great than 1, we will do
     #       gradients aggregation later
-    if FLAGS.cyclic_batch_size_multiplier_tail > 1:
-        # NOTE: an operator to collect computed gradients
-        new_model['gradients_result'] = [g for g, v in gradients_and_vars]
+    # NOTE: an operator to collect computed gradients
+    new_model['gradients_result'] = [g for g, v in gradients_and_vars]
 
-        gradients_and_vars = \
-            [(placeholder(g), v) for g, v in gradients_and_vars]
+    gradients_and_vars = [(placeholder(g), v) for g, v in gradients_and_vars]
 
-        # NOTE: an operator to feed manipulated gradients
-        new_model['gradients_source'] = [g for g, v in gradients_and_vars]
+    # NOTE: an operator to feed manipulated gradients
+    new_model['gradients_source'] = [g for g, v in gradients_and_vars]
 
     new_model['optimizer'] = \
         optimizer.apply_gradients(gradients_and_vars, global_step=step)
@@ -123,12 +123,12 @@ def train(session, experiment):
     step = session.run(model['step'])
 
     # NOTE: learning rate interpolation for cyclic training
-    lr_head = FLAGS.cyclic_learning_rate_head
-    lr_tail = FLAGS.cyclic_learning_rate_tail
+    lr_min = FLAGS.cyclic_learning_rate_min
+    lr_max = FLAGS.cyclic_learning_rate_max
 
     alpha = (step % FLAGS.cyclic_num_steps) / (FLAGS.cyclic_num_steps - 1)
 
-    learning_rate = lr_head + (lr_tail - lr_head) * alpha
+    learning_rate = lr_max + (lr_min - lr_max) * alpha
 
     # NOTE: feeds for training
     feeds = {
@@ -137,50 +137,43 @@ def train(session, experiment):
         model['training']: True,
     }
 
-    # NOTE: if cyclic_batch_size_multiplier_tail is great than 1, we want to do
+    # NOTE: if cyclic_batch_size_multiplier_max is great than 1, we want to do
     #       gradients aggregation
-    if FLAGS.cyclic_batch_size_multiplier_tail > 1:
-        # NOTE: batch multiplier interpolation for cyclic training
-        scale_head = FLAGS.cyclic_batch_size_multiplier_head
-        scale_tail = FLAGS.cyclic_batch_size_multiplier_tail
+    # NOTE: batch multiplier interpolation for cyclic training
+    scale_min = FLAGS.cyclic_batch_size_multiplier_min
+    scale_max = FLAGS.cyclic_batch_size_multiplier_max
 
-        # NOTE: assume FLAGS.cyclic_num_steps being far freater then scale
-        beta = FLAGS.cyclic_num_steps // (scale_tail - scale_head + 1)
+    # NOTE: assume FLAGS.cyclic_num_steps being far freater then scale
+    beta = FLAGS.cyclic_num_steps // (scale_max - scale_min + 1)
 
-        batch_multiplier = scale_head + (step % FLAGS.cyclic_num_steps) // beta
+    batch_multiplier = scale_min + (step % FLAGS.cyclic_num_steps) // beta
 
-        all_gradients = []
+    all_gradients = []
 
-        losses = 0.0
+    losses = 0.0
 
-        # NOTE: compute gradients on nano batches
-        for i in range(batch_multiplier):
-            loss, gradients = session.run(
-                [model['loss'], model['gradients_result']], feed_dict=feeds)
+    # NOTE: compute gradients on nano batches
+    for i in range(batch_multiplier):
+        loss, gradients = session.run(
+            [model['loss'], model['gradients_result']], feed_dict=feeds)
 
-            losses += loss
+        losses += loss
 
-            all_gradients.append(gradients)
+        all_gradients.append(gradients)
 
-        # NOTE: aggregate & apply gradients
-        feeds = {
-            model['learning_rate']: learning_rate,
-        }
+    # NOTE: aggregate & apply gradients
+    feeds = {
+        model['learning_rate']: learning_rate,
+    }
 
-        for i, gradients_source in enumerate(model['gradients_source']):
-            gradients = np.stack([g[i] for g in all_gradients], axis=0)
+    for i, gradients_source in enumerate(model['gradients_source']):
+        gradients = np.stack([g[i] for g in all_gradients], axis=0)
 
-            feeds[gradients_source] = np.mean(gradients, axis=0)
+        feeds[gradients_source] = np.mean(gradients, axis=0)
 
-        session.run(model['optimizer'], feed_dict=feeds)
+    session.run(model['optimizer'], feed_dict=feeds)
 
-        loss = losses / batch_multiplier
-    else:
-        # NOTE: FLAGS.cyclic_batch_size_multiplier_tail <= 1, need no
-        #       gradients aggregation
-        fetch = [model['loss'], model['optimizer']]
-
-        loss, _ = session.run(fetch, feed_dict=feeds)
+    loss = losses / batch_multiplier
 
     step = session.run(model['step'])
 
@@ -462,6 +455,143 @@ def test(session, experiment):
     tf.logging.info('done: {}'.format(FLAGS.result_zip_path))
 
 
+def train_validate_test(session, experiment):
+    """
+    """
+    FLAGS = tf.app.flags.FLAGS
+
+    # NOTE: build file writer to keep log
+    experiment['reporter'] = tf.summary.FileWriter(FLAGS.logs_path)
+
+    # NOTE: initialize all variables or load weights
+    session.run(tf.global_variables_initializer())
+
+    while True:
+        train(session, experiment)
+
+        valid(session, experiment)
+
+        step = session.run(experiment['model']['step'])
+
+        if step >= FLAGS.cyclic_num_steps * FLAGS.cyclic_num_cycles:
+            break
+
+    # NOTE: final test
+    test(session, experiment)
+
+
+def search_learning_rate(session, experiment):
+    """
+    """
+    def train_one_step(session, experiment, lr):
+        """
+        """
+        FLAGS = tf.app.flags.FLAGS
+
+        model = experiment['model']
+
+        # NOTE: feeds for training
+        feeds = {
+            model['dataset_handle']: experiment['data']['train_handle'],
+            model['training']: True,
+        }
+
+        all_gradients = []
+
+        # NOTE: compute gradients on nano batches
+        for i in range(FLAGS.slr_batch_size_multiplier):
+            gradients = session.run(model['gradients_result'], feed_dict=feeds)
+
+            all_gradients.append(gradients)
+
+        # NOTE: aggregate & apply gradients
+        feeds = {model['learning_rate']: lr}
+
+        for i, gradients_source in enumerate(model['gradients_source']):
+            gradients = np.stack([g[i] for g in all_gradients], axis=0)
+
+            feeds[gradients_source] = np.mean(gradients, axis=0)
+
+        session.run(model['optimizer'], feed_dict=feeds)
+
+    def valid_accuracy(session, experiment):
+        """
+        """
+        FLAGS = tf.app.flags.FLAGS
+
+        model = experiment['model']
+
+        # NOTE: reset validation dataset
+        session.run(experiment['data']['valid_iterator'].initializer)
+
+        # NOTE: iterator of validation dataset only iterate the dataset once.
+        logits = []
+        labels = []
+
+        feeds = {
+            model['dataset_handle']: experiment['data']['valid_handle'],
+            model['training']: False,
+        }
+
+        fetch = {
+            'labels': model['labels'],
+            'logits': model['logits'],
+        }
+
+        while True:
+            try:
+                fetched = session.run(fetch, feed_dict=feeds)
+
+                logits.append(fetched['logits'])
+                labels.append(fetched['labels'])
+            except tf.errors.OutOfRangeError:
+                break
+
+        # NOTE: concat matrix
+        logits = np.concatenate(logits, axis=0)
+        labels = np.concatenate(labels, axis=0)
+
+        predictions = np.argsort(logits, axis=1)
+        predictions = predictions[:, -1]
+
+        accuracy = np.sum(predictions == labels) / logits.shape[0]
+
+        return accuracy
+
+    # NOTE:
+    FLAGS = tf.app.flags.FLAGS
+
+    lr_min = FLAGS.slr_learning_rate_min
+    lr_max = FLAGS.slr_learning_rate_max
+
+    trials = []
+
+    for index_trial in range(FLAGS.slr_num_trials):
+        # NOTE: reset variables for next searching round
+        session.run(tf.global_variables_initializer())
+
+        if FLAGS.slr_random:
+            lr = lr_min + (lr_max - lr_min) * np.random.random()
+        else:
+            lr = lr_min + (lr_max - lr_min) * (index_trial / FLAGS.slr_num_trials)
+
+        # NOTE: train a little bits
+        for _ in range(FLAGS.slr_num_steps):
+            train_one_step(session, experiment, lr)
+
+        accuracy = valid_accuracy(session, experiment)
+
+        trials.append((lr, accuracy))
+
+        tf.logging.info('acc [{}][{:.9f}]: {:.4f}'.format(index_trial, lr, accuracy))
+
+    # NOTE: sort by learning rate
+    trials.sort(lambda x: x[0])
+
+    for lr, acc in trails:
+        tf.logging.info('lr: {:.9f}, acc: {:.4f}'.format(lr, acc))
+
+
 def main(_):
     """
     """
@@ -486,12 +616,7 @@ def main(_):
     # NOTE: build model
     experiment['model'] = build_model(experiment['data'])
 
-    # NOTE: build file writer to keep log
-    experiment['reporter'] = tf.summary.FileWriter(FLAGS.logs_path)
-
     with tf.Session() as session:
-        session.run(tf.global_variables_initializer())
-
         # NOTE: initialize training data iterator
         session.run(
             experiment['data']['train_iterator'].initializer,
@@ -506,18 +631,10 @@ def main(_):
         experiment['data']['test_handle'] = \
             session.run(experiment['data']['test_iterator'].string_handle())
 
-        while True:
-            train(session, experiment)
-
-            valid(session, experiment)
-
-            step = session.run(experiment['model']['step'])
-
-            if step >= FLAGS.cyclic_num_steps * FLAGS.cyclic_num_cycles:
-                break
-
-        # NOTE: final test
-        test(session, experiment)
+        if FLAGS.slr_num_trials > 0:
+            search_learning_rate(session, experiment)
+        else:
+            train_validate_test(session, experiment)
 
 
 if __name__ == '__main__':
@@ -547,17 +664,17 @@ if __name__ == '__main__':
     tf.app.flags.DEFINE_integer('cyclic_num_cycles', 1, '')
 
     # NOTE: in each cycle, linearly increase size of mini batch
-    #       from cyclic_batch_size * cyclic_batch_size_multiplier_head
-    #       to   cyclic_batch_size * cyclic_batch_size_multiplier_tail
+    #       from cyclic_batch_size * cyclic_batch_size_multiplier_min
+    #       to   cyclic_batch_size * cyclic_batch_size_multiplier_max
     tf.app.flags.DEFINE_integer('cyclic_batch_size', 1, '')
-    tf.app.flags.DEFINE_integer('cyclic_batch_size_multiplier_head', 1, '')
-    tf.app.flags.DEFINE_integer('cyclic_batch_size_multiplier_tail', 1, '')
+    tf.app.flags.DEFINE_integer('cyclic_batch_size_multiplier_min', 1, '')
+    tf.app.flags.DEFINE_integer('cyclic_batch_size_multiplier_max', 1, '')
 
     # NOTE: in each cycle, linearly decrease learning rate
-    #       from cyclic_learning_rate_head
-    #       to   cyclic_learning_rate_tail
-    tf.app.flags.DEFINE_float('cyclic_learning_rate_head', 0.0001, '')
-    tf.app.flags.DEFINE_float('cyclic_learning_rate_tail', 0.0001, '')
+    #       from cyclic_learning_rate_max
+    #       to   cyclic_learning_rate_min
+    tf.app.flags.DEFINE_float('cyclic_learning_rate_min', 0.0001, '')
+    tf.app.flags.DEFINE_float('cyclic_learning_rate_max', 0.0001, '')
 
     # NOTE: test time augmentation
     tf.app.flags.DEFINE_boolean('tta_enable', False, '')
@@ -574,6 +691,15 @@ if __name__ == '__main__':
 
     # NOTE: stochastic weight averaging (SWA)
     tf.app.flags.DEFINE_boolean('swa_enable', False, '')
+
+    # NOTE: evaluate learning rate
+    tf.app.flags.DEFINE_boolean('slr_random', False, '')
+    tf.app.flags.DEFINE_integer('slr_num_trials', 0, '')
+    tf.app.flags.DEFINE_integer('slr_num_steps', 0, '')
+    tf.app.flags.DEFINE_integer('slr_batch_size_multiplier', 0, '')
+
+    tf.app.flags.DEFINE_float('slr_learning_rate_min', 0.0001, '')
+    tf.app.flags.DEFINE_float('slr_learning_rate_max', 0.0001, '')
 
     # NOTE:
     tf.logging.set_verbosity(tf.logging.INFO)
