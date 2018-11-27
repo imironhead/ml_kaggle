@@ -71,7 +71,7 @@ def build_model(images, strokes, lengths, labels, training):
     tensors = tf.nn.relu(tensors)
 
     block_params = [
-        (64, 1),
+        (64, 2), (64, 1),
         (128, 2), (128, 1),
         (256, 2), (256, 1),
         (512, 2), (512, 1), (512, 1), (512, 1), (512, 1), (512, 1),
@@ -87,13 +87,10 @@ def build_model(images, strokes, lengths, labels, training):
             training,
             'block_{}'.format(i))
 
-    tensors = \
-        tf.nn.avg_pool(tensors, [1, 2, 2, 1], [1, 2, 2, 1], padding='SAME')
+    tensors = tf.reduce_mean(tensors, axis=[1, 2])
 
     # NOTE: flatten for fc
     tensors = tf.layers.flatten(tensors)
-
-    tensors = tf.layers.dropout(tensors, rate=1e-3, training=training)
 
     # NOTE:
     logits = tf.layers.dense(
