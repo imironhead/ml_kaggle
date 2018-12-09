@@ -69,9 +69,21 @@ train-mobilenets: SLR_LEARNING_RATE_MAX=0.0000101
 train-mobilenets: train-local
 ```
 
-# References
+# References - Things I Read during the Competition
 
+- [Improving the Way We Work with Learning Rate](https://techburst.io/improving-the-way-we-work-with-learning-rate-5e99554f163b).
+- [arXiv:1603.09382: Deep Networks with Stochastic Depth](https://arxiv.org/abs/1603.09382)
+- [arXiv:1605.06431: Residual Networks Behave Like Ensembles of Relatively Shallow Networks](https://arxiv.org/abs/1605.06431)
+- [arXiv:1611.05431: Aggregated Residual Transformations for Deep Neural Networks](https://arxiv.org/abs/1611.05431)
+- [arXiv:1704.00109: Snapshot Ensembles: Train 1, get M for free](https://arxiv.org/abs/1704.00109)
+- [arXiv:1704.03477: A Neural Representation of Sketch Drawings](https://arxiv.org/abs/1704.03477)
+- [arXiv:1704.04861: MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications](https://arxiv.org/abs/1704.04861)
+- [arXiv:1707.01083: ShuffleNet: An Extremely Efficient Convolutional Neural Network for Mobile Devices](https://arxiv.org/abs/1707.01083)
+- [arXiv:1709.01507: Squeeze-and-Excitation Networks](https://arxiv.org/abs/1709.01507)
+- [arXiv:1803.05407: Averaging Weights Leads to Wider Optima and Better Generalization](https://arxiv.org/abs/1803.05407)
 
 # Note
 - Try pre-built models in the beginning next time.
-- The forum is a very good place to learn things, even you only read papers they refered.
+- The forum is a very good place to learn things, even only read papers they refered.
+- Depthwise convolution may be conputation efficient but not in my experiments (not well supported by GPU & Tensorflow). I also could not speed mobilenet with two GPU towers (2 Nvidia P-100).
+- Tried some models with 2 Nvidia P-100, had no luck. I/O might be the bottleneck, I will experiment more later.
