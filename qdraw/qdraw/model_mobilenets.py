@@ -75,7 +75,7 @@ def build_model(images, strokes, lengths, labels, training):
         (128, 2), (128, 1),
         (256, 2), (256, 1),
         (512, 2), (512, 1), (512, 1), (512, 1), (512, 1), (512, 1),
-        (1024, 2), (1024, 1),
+        (1024, 2), (1024, 1), (1024, 1),
     ]
 
     for i, (filters, stride) in enumerate(block_params):

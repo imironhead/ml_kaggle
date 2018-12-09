@@ -1,6 +1,7 @@
 """
 """
 import csv
+import datetime
 import gzip
 import os
 import time
@@ -196,7 +197,8 @@ def train(session, experiment):
     experiment['reporter'].add_summary(summary, step)
 
     if step % 1000 == 0:
-        tf.logging.info('loss[{}]: {}'.format(step, loss))
+        ts = datetime.datetime.now().isoformat()
+        tf.logging.info('{} - loss[{}]: {}'.format(ts, step, loss))
 
 
 def valid(session, experiment):
@@ -365,6 +367,13 @@ def test(session, experiment):
 
     model = experiment['model']
 
+    step = session.run(model['step'])
+
+    # NOTE: test only on each end of cycle.
+    #       once a cycle ends, mod of steps goes back to 0 in latest training
+    if step % FLAGS.cyclic_num_steps != 0:
+        return
+
     # NOTE: Averaging Weights Leads to Wider Optima and Better Generalization
     #
     #       replace weights with swa weights
@@ -433,12 +442,20 @@ def test(session, experiment):
         # NOTE: remove augmented part if tta is not enabled
         softmax = softmax[:FLAGS.tta_num_samples_test]
 
+    # NOTE: build path for cyclic testing
+    result_index = step // FLAGS.cyclic_num_steps
+
+    result_zip_path, ext = os.path.splitext(FLAGS.result_zip_path)
+
+    result_zip_path = '{}_{}{}'.format(result_zip_path, result_index, ext)
+
+    # NOTE: write to output file
     keyids = keyids[:FLAGS.tta_num_samples_test]
 
     predictions = np.argsort(softmax, axis=1)
     predictions = predictions[:, -1:-4:-1]
 
-    with gzip.open(FLAGS.result_zip_path, mode='wt', encoding='utf-8') as zf:
+    with gzip.open(result_zip_path, mode='wt', encoding='utf-8') as zf:
         writer = csv.writer(zf, lineterminator='\n')
 
         writer.writerow(['key_id', 'word'])
@@ -452,7 +469,7 @@ def test(session, experiment):
 
             writer.writerow([keyid, guess])
 
-    tf.logging.info('done: {}'.format(FLAGS.result_zip_path))
+    tf.logging.info('done: {}'.format(result_zip_path))
 
 
 def train_validate_test(session, experiment):
@@ -471,13 +488,12 @@ def train_validate_test(session, experiment):
 
         valid(session, experiment)
 
+        test(session, experiment)
+
         step = session.run(experiment['model']['step'])
 
         if step >= FLAGS.cyclic_num_steps * FLAGS.cyclic_num_cycles:
             break
-
-    # NOTE: final test
-    test(session, experiment)
 
 
 def search_learning_rate(session, experiment):
@@ -571,9 +587,9 @@ def search_learning_rate(session, experiment):
         session.run(tf.global_variables_initializer())
 
         if FLAGS.slr_random:
-            lr = lr_min + (lr_max - lr_min) * np.random.random()
+            lr = lr_max + (lr_min - lr_max) * np.random.random()
         else:
-            lr = lr_min + (lr_max - lr_min) * (index_trial / FLAGS.slr_num_trials)
+            lr = lr_max + (lr_min - lr_max) * (index_trial / FLAGS.slr_num_trials)
 
         # NOTE: train a little bits
         for _ in range(FLAGS.slr_num_steps):
@@ -583,12 +599,14 @@ def search_learning_rate(session, experiment):
 
         trials.append((lr, accuracy))
 
-        tf.logging.info('acc [{}][{:.9f}]: {:.4f}'.format(index_trial, lr, accuracy))
+        ts = datetime.datetime.now().isoformat()
+
+        tf.logging.info('{} - acc [{}][{:.9f}]: {:.4f}'.format(ts, index_trial, lr, accuracy))
 
     # NOTE: sort by learning rate
-    trials.sort(lambda x: x[0])
+    trials.sort(key=lambda x: x[0])
 
-    for lr, acc in trails:
+    for lr, acc in trials:
         tf.logging.info('lr: {:.9f}, acc: {:.4f}'.format(lr, acc))
 
 
